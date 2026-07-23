@@ -7,3 +7,6 @@ using.config
 CatalogKconfig
 compile_commands.json
 *.log
+
+# Local demo credentials and endpoint
+include/demo_network_config.h

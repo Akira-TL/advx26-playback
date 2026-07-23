@@ -15,6 +15,7 @@
 #include "board_com_api.h"
 
 #include "mob_screen.h"
+#include "playback_network.h"
 
 static void mob_app_start(void)
 {
@@ -38,6 +39,11 @@ static void mob_app_start(void)
     lv_vendor_disp_unlock();
 
     lv_vendor_start(5, 1024 * 8);
+
+    if (playback_network_start() != OPRT_OK)
+    {
+        PR_ERR("Playback network initialization failed");
+    }
 }
 
 #if OPERATING_SYSTEM == SYSTEM_LINUX
