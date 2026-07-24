@@ -5,9 +5,11 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 
 #include "tal_api.h"
 #include "lvgl.h"
+#include "lv_vendor.h"
 
 #include "mob_screen.h"
 
@@ -18,10 +20,108 @@
 #define MOB_COLOR_MUTED lv_color_hex(0x8D96A8)
 #define MOB_COLOR_ACCENT lv_color_hex(0x74F0C5)
 #define MOB_COLOR_ACCENT_DARK lv_color_hex(0x183C34)
+#define MOB_LVGL_IMAGE_DIMENSION_MAX (2047U)
 
 static lv_obj_t *touch_status_label = NULL;
 static lv_obj_t *touch_button_label = NULL;
+static lv_obj_t *video_screen = NULL;
+static lv_obj_t *video_image = NULL;
+static lv_img_dsc_t video_frame_descriptor;
+static uint16_t *video_frame_pixels = NULL;
+static size_t video_frame_bytes = 0U;
 static bool touch_confirmed = false;
+
+static bool video_surface_is_valid(const playback_rgb565_surface_t *surface)
+{
+    size_t expected_pixel_count;
+
+    if ((surface == NULL) || (surface->pixels == NULL) || (surface->width == 0U) || (surface->height == 0U) ||
+        (surface->width > MOB_LVGL_IMAGE_DIMENSION_MAX) || (surface->height > MOB_LVGL_IMAGE_DIMENSION_MAX))
+    {
+        return false;
+    }
+
+    expected_pixel_count = (size_t)surface->width * (size_t)surface->height;
+    return (surface->pixel_count == expected_pixel_count) &&
+           (surface->stride_bytes == ((uint32_t)surface->width * (uint32_t)sizeof(uint16_t)));
+}
+
+static bool video_display_matches(const playback_rgb565_surface_t *surface, lv_disp_t **display)
+{
+    lv_disp_t *default_display = lv_disp_get_default();
+
+    if ((default_display == NULL) ||
+        (lv_disp_get_hor_res(default_display) != (lv_coord_t)surface->width) ||
+        (lv_disp_get_ver_res(default_display) != (lv_coord_t)surface->height))
+    {
+        return false;
+    }
+
+    *display = default_display;
+    return true;
+}
+
+static bool ensure_video_frame_buffer(size_t required_bytes)
+{
+    uint16_t *new_pixels;
+
+    if ((video_frame_pixels != NULL) && (video_frame_bytes == required_bytes))
+    {
+        return true;
+    }
+
+    new_pixels = tal_psram_malloc(required_bytes);
+    if (new_pixels == NULL)
+    {
+        return false;
+    }
+
+    if (video_frame_pixels != NULL)
+    {
+        tal_psram_free(video_frame_pixels);
+    }
+    video_frame_pixels = new_pixels;
+    video_frame_bytes = required_bytes;
+    return true;
+}
+
+static bool configure_video_screen(const playback_rgb565_surface_t *surface)
+{
+    video_screen = lv_obj_create(NULL);
+    if (video_screen == NULL)
+    {
+        return false;
+    }
+
+    lv_obj_set_style_bg_color(video_screen, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(video_screen, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(video_screen, 0, 0);
+    lv_obj_set_style_pad_all(video_screen, 0, 0);
+    lv_obj_clear_flag(video_screen, LV_OBJ_FLAG_SCROLLABLE);
+
+    video_image = lv_img_create(video_screen);
+    if (video_image == NULL)
+    {
+        lv_obj_del(video_screen);
+        video_screen = NULL;
+        return false;
+    }
+
+    lv_obj_set_size(video_image, (lv_coord_t)surface->width, (lv_coord_t)surface->height);
+    lv_obj_center(video_image);
+    return true;
+}
+
+static void update_video_descriptor(const playback_rgb565_surface_t *surface)
+{
+    video_frame_descriptor.header.always_zero = 0U;
+    video_frame_descriptor.header.cf = LV_IMG_CF_TRUE_COLOR;
+    video_frame_descriptor.header.reserved = 0U;
+    video_frame_descriptor.header.w = (uint32_t)surface->width & MOB_LVGL_IMAGE_DIMENSION_MAX;
+    video_frame_descriptor.header.h = (uint32_t)surface->height & MOB_LVGL_IMAGE_DIMENSION_MAX;
+    video_frame_descriptor.data_size = (uint32_t)video_frame_bytes;
+    video_frame_descriptor.data = (const uint8_t *)video_frame_pixels;
+}
 
 static void configure_transparent_container(lv_obj_t *object)
 {
@@ -155,4 +255,69 @@ void mob_screen_create(void)
     create_footer(screen);
 
     lv_disp_load_scr(screen);
+}
+
+playback_video_output_result_t mob_screen_present_rgb565(
+    void *context,
+    const playback_rgb565_surface_t *surface
+)
+{
+#if (LV_COLOR_DEPTH != 16) || (LV_COLOR_16_SWAP != 0)
+    (void)context;
+    (void)surface;
+    return PLAYBACK_VIDEO_OUTPUT_UNSUPPORTED_CONFIG;
+#else
+    lv_disp_t *display = NULL;
+    size_t required_bytes;
+
+    (void)context;
+
+    if (surface == NULL)
+    {
+        return PLAYBACK_VIDEO_OUTPUT_INVALID_ARGUMENT;
+    }
+    if (!video_surface_is_valid(surface))
+    {
+        return PLAYBACK_VIDEO_OUTPUT_INVALID_FRAME;
+    }
+
+    lv_vendor_disp_lock();
+
+    if (!video_display_matches(surface, &display))
+    {
+        lv_vendor_disp_unlock();
+        return PLAYBACK_VIDEO_OUTPUT_UNSUPPORTED_CONFIG;
+    }
+
+    required_bytes = surface->pixel_count * sizeof(uint16_t);
+    if (!ensure_video_frame_buffer(required_bytes))
+    {
+        lv_vendor_disp_unlock();
+        return PLAYBACK_VIDEO_OUTPUT_NO_MEMORY;
+    }
+
+    memcpy(video_frame_pixels, surface->pixels, required_bytes);
+
+    if ((video_screen == NULL) && !configure_video_screen(surface))
+    {
+        lv_vendor_disp_unlock();
+        return PLAYBACK_VIDEO_OUTPUT_NO_MEMORY;
+    }
+
+    update_video_descriptor(surface);
+    lv_img_set_src(video_image, &video_frame_descriptor);
+
+    if (lv_disp_get_scr_act(display) != video_screen)
+    {
+        lv_disp_load_scr(video_screen);
+    }
+    else
+    {
+        lv_obj_invalidate(video_image);
+    }
+
+    lv_refr_now(display);
+    lv_vendor_disp_unlock();
+    return PLAYBACK_VIDEO_OUTPUT_OK;
+#endif
 }
