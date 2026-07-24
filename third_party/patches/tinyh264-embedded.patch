@@ -78,6 +78,19 @@ index ec2bb08..c10b91a 100644
                            (p1 - q1) + 4) >> 3));
                  p0 = clp[p0 + delta];
                  q0 = clp[q0 - delta];
+diff --git a/native/h264bsd_decoder.h b/native/h264bsd_decoder.h
+index ce05398..77fbf84 100644
+--- a/native/h264bsd_decoder.h
++++ b/native/h264bsd_decoder.h
+@@ -64,7 +64,7 @@ u32 h264bsdInit(storage_t *pStorage, u32 noOutputReordering);
+ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u8 **picture, u32 *width, u32 *height);
+ void h264bsdShutdown(storage_t *pStorage);
+ 
+-storage_t* h264bsdAlloc();
++storage_t* h264bsdAlloc(void);
+ void h264bsdFree(storage_t *pStorage);
+ 
+ #endif /* #ifdef H264SWDEC_DECODER_H */
 diff --git a/native/h264bsd_decoder.c b/native/h264bsd_decoder.c
 index 57dbdc0..e8d4d2b 100644
 --- a/native/h264bsd_decoder.c
@@ -102,7 +115,8 @@ index 57dbdc0..e8d4d2b 100644
  
 @@ -596,7 +595,7 @@ void h264bsdShutdown(storage_t *pStorage)
  
- storage_t* h264bsdAlloc()
+-storage_t* h264bsdAlloc()
++storage_t* h264bsdAlloc(void)
  {
 -    return (storage_t*)malloc(sizeof(storage_t));
 +    return (storage_t*)H264BSD_MALLOC(sizeof(storage_t));
