@@ -5,6 +5,9 @@
 
 #include "tal_api.h"
 #include "tkl_bluetooth.h"
+#include <components/bluetooth/bk_dm_bluetooth_types.h>
+#include <components/bluetooth/bk_dm_gap_ble_types.h>
+#include <components/bluetooth/bk_dm_gap_ble.h>
 
 #include "playback_board_link_json.h"
 #include "playback_board_link_wire.h"
@@ -311,10 +314,9 @@ static OPERATE_RET playback_board_link_gatt_start_advertising(
     scan_response.length = sizeof(playback_board_link_scan_response);
     scan_response.p_data = (uint8_t *)playback_board_link_scan_response;
 
-    result = tkl_ble_gap_name_set((char *)PLAYBACK_BOARD_LINK_GATT_DEVICE_NAME);
-    if (result != OPRT_OK)
+    if (bk_ble_gap_set_device_name(PLAYBACK_BOARD_LINK_GATT_DEVICE_NAME) != 0)
     {
-        return result;
+        return OPRT_COM_ERROR;
     }
     result = tkl_ble_gap_adv_rsp_data_set(&adv_data, &scan_response);
     if (result != OPRT_OK)

@@ -22,6 +22,24 @@ if(TOS_PROJECT_PLATFORM STREQUAL "T5AI")
     set_property(GLOBAL PROPERTY RULE_LAUNCH_CUSTOM
         "python3 ${PLAYBACK_T5AI_LAUNCHER} ${PLAYBACK_T5AI_SDKCONFIG} ${PLAYBACK_T5AI_PARTITIONS}"
     )
+
+    # Tuya's T5AI bk_libs component excludes libhelix.a unconditionally.
+    # Export a project-owned copy through the normal TUYA_LIBS contract so the
+    # direct indexed MP3 decoder resolves without modifying the shared SDK.
+    set(PLAYBACK_T5AI_HELIX_NAME playback_helix)
+    set(PLAYBACK_T5AI_HELIX_SOURCE
+        ${TOP_SOURCE_DIR}/platform/T5AI/t5_os/ap/components/bk_libs/bk7258_ap/libs/libhelix.a
+    )
+    if(NOT EXISTS ${PLAYBACK_T5AI_HELIX_SOURCE})
+        message(FATAL_ERROR "missing T5AI Helix archive: ${PLAYBACK_T5AI_HELIX_SOURCE}")
+    endif()
+    file(MAKE_DIRECTORY ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY})
+    configure_file(
+        ${PLAYBACK_T5AI_HELIX_SOURCE}
+        ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}/lib${PLAYBACK_T5AI_HELIX_NAME}.a
+        COPYONLY
+    )
+    string(APPEND PLATFORM_NEED_LIBS " ${PLAYBACK_T5AI_HELIX_NAME}")
 endif()
 
 aux_source_directory(${APP_PATH}/src APP_SRC)
