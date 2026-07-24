@@ -467,13 +467,46 @@ static void playback_bluetooth_gap_callback(
             }
             else
             {
+                tal_mutex_lock(state->mutex);
+                if (state->has_link_key &&
+                    playback_bluetooth_address_equal(
+                        state->link_key.addr,
+                        parameter->auth_cmpl.bda
+                    ))
+                {
+                    memset(&state->link_key, 0, sizeof(state->link_key));
+                    state->has_link_key = false;
+                }
+                tal_mutex_unlock(state->mutex);
+
+                if (state->config.on_auth_failure != NULL)
+                {
+                    state->config.on_auth_failure(
+                        state->config.context,
+                        parameter->auth_cmpl.bda
+                    );
+                }
+                (void)bk_bt_gap_remove_bond_device(parameter->auth_cmpl.bda);
                 playback_bluetooth_publish_status(
                     state,
                     PLAYBACK_BLUETOOTH_BROWSER_FAILED,
                     parameter->auth_cmpl.bda,
-                    "Bluetooth authentication failed"
+                    "Authentication failed; clearing local pairing"
                 );
             }
+            break;
+
+        case BK_BT_GAP_REMOVE_BOND_DEV_COMPLETE_EVT:
+            playback_bluetooth_publish_status(
+                state,
+                parameter->remove_bond_dev_cmpl.status == BK_BT_STATUS_SUCCESS
+                    ? PLAYBACK_BLUETOOTH_BROWSER_IDLE
+                    : PLAYBACK_BLUETOOTH_BROWSER_FAILED,
+                parameter->remove_bond_dev_cmpl.bda,
+                parameter->remove_bond_dev_cmpl.status == BK_BT_STATUS_SUCCESS
+                    ? "Pairing cleared; put speaker in pairing mode and tap again"
+                    : "Unable to clear local pairing"
+            );
             break;
 
         case BK_BT_GAP_ACL_CONN_CMPL_STAT_EVT:

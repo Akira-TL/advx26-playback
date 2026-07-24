@@ -48,10 +48,16 @@ typedef void (*playback_bluetooth_browser_status_cb)(
     const char *detail
 );
 
+typedef void (*playback_bluetooth_browser_auth_failure_cb)(
+    void *context,
+    const uint8_t address[PLAYBACK_BLUETOOTH_ADDRESS_BYTES]
+);
+
 typedef struct
 {
     playback_bluetooth_browser_devices_cb on_devices;
     playback_bluetooth_browser_status_cb on_status;
+    playback_bluetooth_browser_auth_failure_cb on_auth_failure;
     void *context;
 } playback_bluetooth_browser_config_t;
 

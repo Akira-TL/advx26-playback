@@ -203,6 +203,33 @@ static void playback_app_bluetooth_status_callback(
     );
 }
 
+static void playback_app_bluetooth_auth_failure_callback(
+    void *context,
+    const uint8_t address[PLAYBACK_BLUETOOTH_ADDRESS_BYTES]
+)
+{
+    playback_app_state_t *state = context;
+    playback_speaker_link_status_t speaker_status;
+
+    if ((state == NULL) || (address == NULL) ||
+        (state->speaker_probe.state == NULL) ||
+        (playback_speaker_link_get_status(
+             &state->speaker_probe,
+             &speaker_status
+         ) != PLAYBACK_SPEAKER_LINK_OK) ||
+        (memcmp(
+             speaker_status.target_address,
+             address,
+             sizeof(speaker_status.target_address)
+         ) != 0))
+    {
+        return;
+    }
+
+    PR_WARN("Bluetooth authentication failed; pausing A2DP retries until user taps again");
+    (void)playback_speaker_link_disconnect(&state->speaker_probe);
+}
+
 static void playback_app_bluetooth_scan_callback(void *context)
 {
     playback_app_state_t *state = context;
@@ -223,6 +250,7 @@ static void playback_app_bluetooth_connect_callback(
     playback_engine_result_t engine_result;
     playback_speaker_link_config_t speaker_config;
     playback_speaker_link_result_t speaker_result;
+    playback_speaker_link_status_t speaker_status;
 
     if ((state == NULL) || (address == NULL))
     {
@@ -245,6 +273,27 @@ static void playback_app_bluetooth_connect_callback(
     if (!playback_bluetooth_browser_connect(&state->bluetooth_browser, address))
     {
         PR_WARN("Unable to select Bluetooth speaker");
+        return;
+    }
+
+    if ((state->speaker_probe.state != NULL) &&
+        (playback_speaker_link_get_status(
+             &state->speaker_probe,
+             &speaker_status
+         ) == PLAYBACK_SPEAKER_LINK_OK) &&
+        (memcmp(
+             speaker_status.target_address,
+             address,
+             sizeof(speaker_status.target_address)
+         ) == 0))
+    {
+        PR_NOTICE("Reusing existing A2DP speaker link");
+        if ((speaker_status.state == PLAYBACK_SPEAKER_DISCONNECTED) ||
+            (speaker_status.state == PLAYBACK_SPEAKER_CONNECTING))
+        {
+            (void)playback_speaker_link_reconnect(&state->speaker_probe);
+        }
+        (void)playback_speaker_link_start(&state->speaker_probe);
         return;
     }
 
@@ -523,6 +572,7 @@ OPERATE_RET playback_app_start(void)
     memset(&bluetooth_config, 0, sizeof(bluetooth_config));
     bluetooth_config.on_devices = playback_app_bluetooth_devices_callback;
     bluetooth_config.on_status = playback_app_bluetooth_status_callback;
+    bluetooth_config.on_auth_failure = playback_app_bluetooth_auth_failure_callback;
     bluetooth_config.context = &playback_app_state;
     if (!playback_bluetooth_browser_init(
             &playback_app_state.bluetooth_browser,

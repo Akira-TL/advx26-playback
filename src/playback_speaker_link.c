@@ -13,6 +13,9 @@
 #define PLAYBACK_SPEAKER_RECONNECT_INITIAL_MS    (1000U)
 #define PLAYBACK_SPEAKER_RECONNECT_MAX_MS        (5000U)
 #define PLAYBACK_SPEAKER_CONNECT_TIMEOUT_MS      (10000U)
+#define PLAYBACK_SPEAKER_DISCONNECT_TIMEOUT_MS   (3000U)
+#define PLAYBACK_SPEAKER_CLOSE_WAIT_MS           (3500U)
+#define PLAYBACK_SPEAKER_CLOSE_POLL_MS           (50U)
 #define PLAYBACK_SPEAKER_MEDIA_TIMEOUT_MS        (3000U)
 #define PLAYBACK_SPEAKER_SBC_CODEC_TYPE          (0U)
 #define PLAYBACK_SPEAKER_SBC_MAX_PCM_FRAMES      (128U)
@@ -92,8 +95,10 @@ typedef struct
     playback_speaker_media_request_t media_request;
     uint32_t media_request_ms;
     uint32_t connect_request_ms;
+    uint32_t disconnect_request_ms;
     uint32_t next_reconnect_ms;
     uint32_t reconnect_delay_ms;
+    bool disconnect_pending;
 } playback_speaker_link_state_t;
 
 static playback_speaker_link_state_t *playback_speaker_active_state = NULL;
@@ -758,6 +763,30 @@ static void playback_speaker_schedule_retry(playback_speaker_link_state_t *state
     }
 }
 
+static bool playback_speaker_request_disconnect(
+    playback_speaker_link_state_t *state,
+    uint32_t now
+)
+{
+    int32_t result;
+
+    if (state->disconnect_pending)
+    {
+        return true;
+    }
+
+    result = bk_bt_a2dp_source_disconnect(state->config.target_address);
+    if (result != 0)
+    {
+        playback_speaker_set_error(state, PLAYBACK_SPEAKER_LINK_PLATFORM_ERROR, result);
+        return false;
+    }
+
+    state->disconnect_pending = true;
+    state->disconnect_request_ms = now;
+    return true;
+}
+
 static void playback_speaker_reconcile(playback_speaker_link_state_t *state)
 {
     playback_speaker_link_status_t status;
@@ -770,16 +799,32 @@ static void playback_speaker_reconcile(playback_speaker_link_state_t *state)
     }
 
     if ((status.state == PLAYBACK_SPEAKER_CONNECTING) &&
+        !state->disconnect_pending &&
         playback_speaker_time_reached(now, state->connect_request_ms + PLAYBACK_SPEAKER_CONNECT_TIMEOUT_MS))
     {
-        tal_mutex_lock(state->status_mutex);
-        state->status.state = PLAYBACK_SPEAKER_DISCONNECTED;
-        memset(state->status.remote_address, 0, sizeof(state->status.remote_address));
-        state->status.last_result = PLAYBACK_SPEAKER_LINK_PLATFORM_ERROR;
-        state->status.last_platform_error = PLAYBACK_SPEAKER_INVALID_PLATFORM_ERROR;
-        tal_mutex_unlock(state->status_mutex);
-        playback_speaker_schedule_retry(state, now);
-        playback_speaker_status_snapshot(state, &status);
+        PR_WARN("A2DP connect timeout; releasing stale signalling entity");
+        playback_speaker_set_error(
+            state,
+            PLAYBACK_SPEAKER_LINK_PLATFORM_ERROR,
+            PLAYBACK_SPEAKER_INVALID_PLATFORM_ERROR
+        );
+        (void)playback_speaker_request_disconnect(state, now);
+        playback_speaker_publish_status(state);
+        return;
+    }
+
+    if (state->disconnect_pending)
+    {
+        if (playback_speaker_time_reached(
+                now,
+                state->disconnect_request_ms + PLAYBACK_SPEAKER_DISCONNECT_TIMEOUT_MS
+            ))
+        {
+            PR_WARN("A2DP disconnect confirmation timeout; retrying cleanup");
+            state->disconnect_pending = false;
+            (void)playback_speaker_request_disconnect(state, now);
+        }
+        return;
     }
 
     if ((state->media_request != PLAYBACK_SPEAKER_MEDIA_NONE) &&
@@ -815,11 +860,7 @@ static void playback_speaker_reconcile(playback_speaker_link_state_t *state)
             (status.state == PLAYBACK_SPEAKER_STREAMING) ||
             (status.state == PLAYBACK_SPEAKER_CONNECTING))
         {
-            const int32_t result = bk_bt_a2dp_source_disconnect(state->config.target_address);
-            if (result != 0)
-            {
-                playback_speaker_set_error(state, PLAYBACK_SPEAKER_LINK_PLATFORM_ERROR, result);
-            }
+            (void)playback_speaker_request_disconnect(state, now);
         }
         return;
     }
@@ -952,6 +993,8 @@ static void playback_speaker_process_connection(
     switch (event->data.connection.state)
     {
         case BK_A2DP_CONNECTION_STATE_DISCONNECTED:
+            PR_NOTICE("A2DP disconnected; signalling entity released");
+            state->disconnect_pending = false;
             state->status.state = PLAYBACK_SPEAKER_DISCONNECTED;
             state->status.codec_ready = false;
             state->status.negotiated_sample_rate = 0U;
@@ -1100,12 +1143,14 @@ static void playback_speaker_worker(void *argument)
             case PLAYBACK_SPEAKER_EVENT_FORCE_RECONNECT:
             {
                 playback_speaker_link_status_t status;
-                state->next_reconnect_ms = (uint32_t)tal_system_get_millisecond();
+                const uint32_t now = (uint32_t)tal_system_get_millisecond();
+
+                state->next_reconnect_ms = now;
                 state->reconnect_delay_ms = PLAYBACK_SPEAKER_RECONNECT_INITIAL_MS;
                 playback_speaker_status_snapshot(state, &status);
                 if (status.state != PLAYBACK_SPEAKER_DISCONNECTED)
                 {
-                    (void)bk_bt_a2dp_source_disconnect(state->config.target_address);
+                    (void)playback_speaker_request_disconnect(state, now);
                 }
                 break;
             }
@@ -1451,8 +1496,35 @@ void playback_speaker_link_close(playback_speaker_link_t *link)
         return;
     }
     state = link->state;
-    state->closing = true;
 
+    tal_mutex_lock(state->status_mutex);
+    state->status.desired_connected = false;
+    state->status.desired_streaming = false;
+    tal_mutex_unlock(state->status_mutex);
+
+    memset(&stop_event, 0, sizeof(stop_event));
+    stop_event.kind = PLAYBACK_SPEAKER_EVENT_WAKE;
+    (void)playback_speaker_enqueue(state, &stop_event);
+
+    {
+        const uint32_t deadline =
+            (uint32_t)tal_system_get_millisecond() + PLAYBACK_SPEAKER_CLOSE_WAIT_MS;
+
+        do
+        {
+            playback_speaker_status_snapshot(state, &status);
+            if (status.state == PLAYBACK_SPEAKER_DISCONNECTED)
+            {
+                break;
+            }
+            tal_system_sleep(PLAYBACK_SPEAKER_CLOSE_POLL_MS);
+        } while (!playback_speaker_time_reached(
+            (uint32_t)tal_system_get_millisecond(),
+            deadline
+        ));
+    }
+
+    state->closing = true;
     tal_mutex_lock(playback_speaker_callback_mutex);
     if (playback_speaker_active_state == state)
     {
@@ -1460,17 +1532,6 @@ void playback_speaker_link_close(playback_speaker_link_t *link)
     }
     tal_mutex_unlock(playback_speaker_callback_mutex);
 
-    playback_speaker_status_snapshot(state, &status);
-    if (status.state == PLAYBACK_SPEAKER_STREAMING)
-    {
-        (void)bk_a2dp_media_ctrl(BK_A2DP_MEDIA_CTRL_SUSPEND);
-    }
-    if ((status.state == PLAYBACK_SPEAKER_CONNECTED) ||
-        (status.state == PLAYBACK_SPEAKER_STREAMING) ||
-        (status.state == PLAYBACK_SPEAKER_CONNECTING))
-    {
-        (void)bk_bt_a2dp_source_disconnect(state->config.target_address);
-    }
     memset(&stop_event, 0, sizeof(stop_event));
     stop_event.kind = PLAYBACK_SPEAKER_EVENT_STOP;
     (void)tal_queue_post(state->event_queue, &stop_event, QUEUE_WAIT_FOREVER);
