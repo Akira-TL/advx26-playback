@@ -12,7 +12,7 @@
 #include "tal_api.h"
 
 #define PLAYBACK_ENGINE_WORKER_POLL_MS (50U)
-#define PLAYBACK_ENGINE_WORKER_STACK_SIZE (8192U)
+#define PLAYBACK_ENGINE_WORKER_STACK_SIZE (12U * 1024U)
 #define PLAYBACK_ENGINE_INDEX_MAX_BYTES \
     (PLAYBACK_AUDIO_INDEX_HEADER_SIZE + \
      (PLAYBACK_AUDIO_INDEX_MAX_RECORDS * PLAYBACK_AUDIO_INDEX_RECORD_SIZE))
@@ -43,6 +43,10 @@ typedef struct
     playback_media_scheduler_t scheduler;
     bool scheduler_active;
     playback_snapshot_t snapshot;
+    /* Worker-owned PSRAM scratch avoids multi-kilobyte command stack frames. */
+    playback_snapshot_t scratch_snapshot;
+    playback_media_package_t scratch_package;
+    playback_report_t scratch_report;
     MUTEX_HANDLE snapshot_mutex;
     QUEUE_HANDLE command_queue;
     SEM_HANDLE worker_stopped;
@@ -288,67 +292,67 @@ static void playback_engine_publish_snapshot(
     bool allow_progress
 )
 {
-    playback_snapshot_t snapshot;
-    playback_report_t report;
+    playback_snapshot_t *snapshot = &state->scratch_snapshot;
+    playback_report_t *report = &state->scratch_report;
     const uint32_t now = (uint32_t)tal_system_get_millisecond();
     bool state_changed;
 
-    playback_engine_snapshot_copy(state, &snapshot);
+    playback_engine_snapshot_copy(state, snapshot);
     state_changed = !state->has_published_state ||
-                    (snapshot.state != state->published_state) ||
-                    (snapshot.intent != state->published_intent) ||
-                    (snapshot.error != state->published_error);
+                    (snapshot->state != state->published_state) ||
+                    (snapshot->intent != state->published_intent) ||
+                    (snapshot->error != state->published_error);
 
     if (force || state_changed)
     {
-        memset(&report, 0, sizeof(report));
-        report.kind = (snapshot.state == PLAYBACK_STATE_COMPLETED)
-                          ? PLAYBACK_REPORT_COMPLETED
-                          : ((snapshot.state == PLAYBACK_STATE_ERROR)
-                                 ? PLAYBACK_REPORT_ERROR
-                                 : PLAYBACK_REPORT_STATE);
+        memset(report, 0, sizeof(*report));
+        report->kind = (snapshot->state == PLAYBACK_STATE_COMPLETED)
+                           ? PLAYBACK_REPORT_COMPLETED
+                           : ((snapshot->state == PLAYBACK_STATE_ERROR)
+                                  ? PLAYBACK_REPORT_ERROR
+                                  : PLAYBACK_REPORT_STATE);
         playback_engine_copy_string(
-            report.session_id,
-            sizeof(report.session_id),
-            snapshot.has_session ? snapshot.session.session_id : ""
+            report->session_id,
+            sizeof(report->session_id),
+            snapshot->has_session ? snapshot->session.session_id : ""
         );
-        report.state = snapshot.state;
-        report.intent = snapshot.intent;
-        report.error = snapshot.error;
-        report.retryable = snapshot.retryable;
-        report.position_ms = snapshot.position_ms;
-        report.duration_ms = snapshot.has_session ? snapshot.session.duration_ms : 0U;
+        report->state = snapshot->state;
+        report->intent = snapshot->intent;
+        report->error = snapshot->error;
+        report->retryable = snapshot->retryable;
+        report->position_ms = snapshot->position_ms;
+        report->duration_ms = snapshot->has_session ? snapshot->session.duration_ms : 0U;
         playback_engine_copy_string(
-            report.diagnostic,
-            sizeof(report.diagnostic),
-            snapshot.diagnostic
+            report->diagnostic,
+            sizeof(report->diagnostic),
+            snapshot->diagnostic
         );
-        playback_engine_emit(state, &report);
-        state->published_state = snapshot.state;
-        state->published_intent = snapshot.intent;
-        state->published_error = snapshot.error;
+        playback_engine_emit(state, report);
+        state->published_state = snapshot->state;
+        state->published_intent = snapshot->intent;
+        state->published_error = snapshot->error;
         state->has_published_state = true;
-        if (snapshot.state == PLAYBACK_STATE_PLAYING)
+        if (snapshot->state == PLAYBACK_STATE_PLAYING)
         {
             state->last_progress_ms = now;
         }
     }
 
-    if (allow_progress && (snapshot.state == PLAYBACK_STATE_PLAYING) &&
+    if (allow_progress && (snapshot->state == PLAYBACK_STATE_PLAYING) &&
         ((uint32_t)(now - state->last_progress_ms) >= PLAYBACK_ENGINE_PROGRESS_INTERVAL_MS))
     {
-        memset(&report, 0, sizeof(report));
-        report.kind = PLAYBACK_REPORT_PROGRESS;
+        memset(report, 0, sizeof(*report));
+        report->kind = PLAYBACK_REPORT_PROGRESS;
         playback_engine_copy_string(
-            report.session_id,
-            sizeof(report.session_id),
-            snapshot.session.session_id
+            report->session_id,
+            sizeof(report->session_id),
+            snapshot->session.session_id
         );
-        report.state = snapshot.state;
-        report.intent = snapshot.intent;
-        report.position_ms = snapshot.position_ms;
-        report.duration_ms = snapshot.session.duration_ms;
-        playback_engine_emit(state, &report);
+        report->state = snapshot->state;
+        report->intent = snapshot->intent;
+        report->position_ms = snapshot->position_ms;
+        report->duration_ms = snapshot->session.duration_ms;
+        playback_engine_emit(state, report);
         state->last_progress_ms = now;
     }
 }
@@ -378,18 +382,18 @@ static void playback_engine_set_error(
     const char *diagnostic
 )
 {
-    playback_snapshot_t snapshot;
+    playback_snapshot_t *snapshot = &state->scratch_snapshot;
 
-    playback_engine_snapshot_copy(state, &snapshot);
-    snapshot.state = PLAYBACK_STATE_ERROR;
-    snapshot.error = error;
-    snapshot.retryable = retryable;
+    playback_engine_snapshot_copy(state, snapshot);
+    snapshot->state = PLAYBACK_STATE_ERROR;
+    snapshot->error = error;
+    snapshot->retryable = retryable;
     playback_engine_copy_string(
-        snapshot.diagnostic,
-        sizeof(snapshot.diagnostic),
+        snapshot->diagnostic,
+        sizeof(snapshot->diagnostic),
         diagnostic
     );
-    playback_engine_snapshot_store(state, &snapshot);
+    playback_engine_snapshot_store(state, snapshot);
 }
 
 static playback_engine_result_t playback_engine_load_index(
@@ -491,17 +495,17 @@ static bool playback_engine_session_matches(
     const playback_command_t *command
 )
 {
-    playback_snapshot_t snapshot;
+    playback_snapshot_t *snapshot = &state->scratch_snapshot;
 
-    playback_engine_snapshot_copy(state, &snapshot);
-    return snapshot.has_session &&
-           (strcmp(snapshot.session.session_id, command->session_id) == 0);
+    playback_engine_snapshot_copy(state, snapshot);
+    return snapshot->has_session &&
+           (strcmp(snapshot->session.session_id, command->session_id) == 0);
 }
 
 static void playback_engine_sync_scheduler(playback_engine_state_t *state)
 {
     playback_media_scheduler_snapshot_t scheduler_snapshot;
-    playback_snapshot_t snapshot;
+    playback_snapshot_t *snapshot = &state->scratch_snapshot;
     playback_media_scheduler_result_t result;
 
     if (!state->scheduler_active)
@@ -523,17 +527,17 @@ static void playback_engine_sync_scheduler(playback_engine_state_t *state)
         return;
     }
 
-    playback_engine_snapshot_copy(state, &snapshot);
-    snapshot.state = scheduler_snapshot.state;
-    snapshot.intent = scheduler_snapshot.intent;
-    snapshot.error = scheduler_snapshot.error;
-    snapshot.position_ms = scheduler_snapshot.position_ms;
+    playback_engine_snapshot_copy(state, snapshot);
+    snapshot->state = scheduler_snapshot.state;
+    snapshot->intent = scheduler_snapshot.intent;
+    snapshot->error = scheduler_snapshot.error;
+    snapshot->position_ms = scheduler_snapshot.position_ms;
     if (scheduler_snapshot.state != PLAYBACK_STATE_ERROR)
     {
-        snapshot.retryable = false;
-        snapshot.diagnostic[0] = '\0';
+        snapshot->retryable = false;
+        snapshot->diagnostic[0] = '\0';
     }
-    playback_engine_snapshot_store(state, &snapshot);
+    playback_engine_snapshot_store(state, snapshot);
 }
 
 static bool playback_engine_handle_load(
@@ -542,14 +546,14 @@ static bool playback_engine_handle_load(
     playback_nack_t *nack
 )
 {
-    playback_media_package_t package;
+    playback_media_package_t *package = &state->scratch_package;
     playback_audio_index_t index;
     playback_audio_index_record_t *records = NULL;
     playback_media_scheduler_result_t scheduler_result;
     playback_engine_result_t index_result;
     playback_error_t load_error;
 
-    if (playback_media_package_validate(&command->payload.session, &package) !=
+    if (playback_media_package_validate(&command->payload.session, package) !=
         PLAYBACK_PACKAGE_OK)
     {
         *nack = PLAYBACK_NACK_UNSUPPORTED_PROFILE;
@@ -582,7 +586,7 @@ static bool playback_engine_handle_load(
 
     scheduler_result = playback_media_scheduler_prepare(
         &state->scheduler,
-        &package,
+        package,
         &index,
         &state->config.scheduler
     );
@@ -611,7 +615,7 @@ static bool playback_engine_handle_control(
 )
 {
     playback_media_scheduler_result_t result = PLAYBACK_SCHEDULER_OK;
-    playback_snapshot_t snapshot;
+    playback_snapshot_t *snapshot = &state->scratch_snapshot;
 
     if (command->kind == PLAYBACK_COMMAND_STOP)
     {
@@ -625,16 +629,16 @@ static bool playback_engine_handle_control(
             playback_media_scheduler_close(&state->scheduler);
             state->scheduler_active = false;
         }
-        playback_engine_snapshot_copy(state, &snapshot);
-        memset(&snapshot.session, 0, sizeof(snapshot.session));
-        snapshot.has_session = false;
-        snapshot.state = PLAYBACK_STATE_IDLE;
-        snapshot.intent = PLAYBACK_INTENT_PAUSED;
-        snapshot.position_ms = 0U;
-        snapshot.error = PLAYBACK_ERROR_NONE;
-        snapshot.retryable = false;
-        snapshot.diagnostic[0] = '\0';
-        playback_engine_snapshot_store(state, &snapshot);
+        playback_engine_snapshot_copy(state, snapshot);
+        memset(&snapshot->session, 0, sizeof(snapshot->session));
+        snapshot->has_session = false;
+        snapshot->state = PLAYBACK_STATE_IDLE;
+        snapshot->intent = PLAYBACK_INTENT_PAUSED;
+        snapshot->position_ms = 0U;
+        snapshot->error = PLAYBACK_ERROR_NONE;
+        snapshot->retryable = false;
+        snapshot->diagnostic[0] = '\0';
+        playback_engine_snapshot_store(state, snapshot);
         return true;
     }
 
@@ -653,8 +657,8 @@ static bool playback_engine_handle_control(
             result = playback_media_scheduler_pause(&state->scheduler);
             break;
         case PLAYBACK_COMMAND_SEEK_MS:
-            playback_engine_snapshot_copy(state, &snapshot);
-            if (command->payload.seek_position_ms > snapshot.session.duration_ms)
+            playback_engine_snapshot_copy(state, snapshot);
+            if (command->payload.seek_position_ms > snapshot->session.duration_ms)
             {
                 *nack = PLAYBACK_NACK_INVALID_STATE;
                 return false;
@@ -727,7 +731,7 @@ static void playback_engine_process_command(
 )
 {
     playback_engine_cache_entry_t *cached;
-    playback_report_t final_report;
+    playback_report_t *final_report = &state->scratch_report;
     playback_nack_t nack;
     uint64_t fingerprint;
     bool accepted;
@@ -743,12 +747,12 @@ static void playback_engine_process_command(
         else
         {
             playback_engine_make_nack(
-                &final_report,
+                final_report,
                 command,
                 PLAYBACK_NACK_DUPLICATE_SEQUENCE_CONFLICT,
                 "sequence id reused with different command"
             );
-            playback_engine_emit(state, &final_report);
+            playback_engine_emit(state, final_report);
         }
         return;
     }
@@ -758,7 +762,7 @@ static void playback_engine_process_command(
          (command->sequence_id <= state->highest_sequence_id)))
     {
         playback_engine_make_nack(
-            &final_report,
+            final_report,
             command,
             PLAYBACK_NACK_DUPLICATE_SEQUENCE_CONFLICT,
             "sequence id is not monotonic"
@@ -767,26 +771,26 @@ static void playback_engine_process_command(
             state,
             command->sequence_id,
             fingerprint,
-            &final_report
+            final_report
         );
-        playback_engine_emit(state, &final_report);
+        playback_engine_emit(state, final_report);
         return;
     }
     state->highest_sequence_id = command->sequence_id;
 
     if (command->kind == PLAYBACK_COMMAND_LOAD_SESSION)
     {
-        playback_media_package_t validated_package;
-        playback_snapshot_t snapshot;
+        playback_media_package_t *validated_package = &state->scratch_package;
+        playback_snapshot_t *snapshot = &state->scratch_snapshot;
         playback_event_t event;
 
         if (playback_media_package_validate(
                 &command->payload.session,
-                &validated_package
+                validated_package
             ) != PLAYBACK_PACKAGE_OK)
         {
             playback_engine_make_nack(
-                &final_report,
+                final_report,
                 command,
                 PLAYBACK_NACK_UNSUPPORTED_PROFILE,
                 "invalid media package"
@@ -795,20 +799,20 @@ static void playback_engine_process_command(
                 state,
                 command->sequence_id,
                 fingerprint,
-                &final_report
+                final_report
             );
-            playback_engine_emit(state, &final_report);
+            playback_engine_emit(state, final_report);
             return;
         }
 
-        playback_engine_snapshot_copy(state, &snapshot);
+        playback_engine_snapshot_copy(state, snapshot);
         memset(&event, 0, sizeof(event));
         event.kind = PLAYBACK_EVENT_LOAD_ACCEPTED;
         event.session = &command->payload.session;
-        if (playback_snapshot_apply(&snapshot, &event) != PLAYBACK_RESULT_OK)
+        if (playback_snapshot_apply(snapshot, &event) != PLAYBACK_RESULT_OK)
         {
             playback_engine_make_nack(
-                &final_report,
+                final_report,
                 command,
                 PLAYBACK_NACK_INVALID_STATE,
                 "load transition rejected"
@@ -817,21 +821,21 @@ static void playback_engine_process_command(
                 state,
                 command->sequence_id,
                 fingerprint,
-                &final_report
+                final_report
             );
-            playback_engine_emit(state, &final_report);
+            playback_engine_emit(state, final_report);
             return;
         }
 
-        playback_engine_snapshot_store(state, &snapshot);
-        playback_engine_make_ack(&final_report, command);
+        playback_engine_snapshot_store(state, snapshot);
+        playback_engine_make_ack(final_report, command);
         playback_engine_cache_report(
             state,
             command->sequence_id,
             fingerprint,
-            &final_report
+            final_report
         );
-        playback_engine_emit(state, &final_report);
+        playback_engine_emit(state, final_report);
         playback_engine_publish_snapshot(state, true, false);
         (void)playback_engine_handle_load(state, command, &nack);
         playback_engine_publish_snapshot(state, true, false);
@@ -841,12 +845,12 @@ static void playback_engine_process_command(
     accepted = playback_engine_execute(state, command, &nack);
     if (accepted)
     {
-        playback_engine_make_ack(&final_report, command);
+        playback_engine_make_ack(final_report, command);
     }
     else
     {
         playback_engine_make_nack(
-            &final_report,
+            final_report,
             command,
             nack,
             playback_nack_name(nack)
@@ -856,9 +860,9 @@ static void playback_engine_process_command(
         state,
         command->sequence_id,
         fingerprint,
-        &final_report
+        final_report
     );
-    playback_engine_emit(state, &final_report);
+    playback_engine_emit(state, final_report);
     if (accepted)
     {
         playback_engine_publish_snapshot(state, true, false);
