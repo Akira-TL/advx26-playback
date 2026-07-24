@@ -242,7 +242,6 @@ async def run(args: argparse.Namespace) -> int:
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     assembler = ReportAssembler(queue)
     async with BleakClient(device, timeout=args.connect_timeout) as client:
-        print(f"已连接，MTU={client.mtu_size}")
         available_uuids = {
             characteristic.uuid.lower()
             for service in client.services
@@ -253,6 +252,7 @@ async def run(args: argparse.Namespace) -> int:
             raise RuntimeError(f"未发现 Board Link 特征；设备特征：{discovered}")
         await client.start_notify(REPORT_UUID, assembler.feed)
         att_value_size = await negotiate_att_value_size(client, args.att_value_size)
+        print(f"已连接，MTU={att_value_size + 3}，ATT value={att_value_size}")
 
         await send_command(
             client,
