@@ -6,6 +6,24 @@
 set(APP_PATH ${CMAKE_CURRENT_LIST_DIR})
 get_filename_component(APP_NAME ${APP_PATH} NAME)
 
+if(TOS_PROJECT_PLATFORM STREQUAL "T5AI")
+    set(PLAYBACK_T5AI_SDKCONFIG ${APP_PATH}/config/t5ai_sdkconfig.defaults)
+    if(NOT EXISTS ${PLAYBACK_T5AI_SDKCONFIG})
+        message(FATAL_ERROR "missing T5AI sdkconfig fragment: ${PLAYBACK_T5AI_SDKCONFIG}")
+    endif()
+    set(PLAYBACK_T5AI_PARTITIONS ${APP_PATH}/config/t5ai_auto_partitions.csv)
+    if(NOT EXISTS ${PLAYBACK_T5AI_PARTITIONS})
+        message(FATAL_ERROR "missing T5AI partition table: ${PLAYBACK_T5AI_PARTITIONS}")
+    endif()
+    set(PLAYBACK_T5AI_LAUNCHER ${APP_PATH}/tools/t5ai_custom_launcher.py)
+    if(NOT EXISTS ${PLAYBACK_T5AI_LAUNCHER})
+        message(FATAL_ERROR "missing T5AI custom-command launcher: ${PLAYBACK_T5AI_LAUNCHER}")
+    endif()
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_CUSTOM
+        "python3 ${PLAYBACK_T5AI_LAUNCHER} ${PLAYBACK_T5AI_SDKCONFIG} ${PLAYBACK_T5AI_PARTITIONS}"
+    )
+endif()
+
 aux_source_directory(${APP_PATH}/src APP_SRC)
 set(APP_INC ${APP_PATH}/include)
 

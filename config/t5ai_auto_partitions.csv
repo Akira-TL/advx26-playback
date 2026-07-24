@@ -1,0 +1,13 @@
+# Playback dual-host partition layout for the 8 MiB T5AI flash.
+# Code partitions occupy size * 34 / 32 physical bytes and must be 68 KiB aligned.
+#Name,Offset,Size,Type,Read,Write
+primary_bootloader,         ,   68k,   code,TRUE,FALSE
+primary_tuyaboot,           ,   68k,   code,TRUE,FALSE
+primary_cp_app,             ,   1224k, code,TRUE,FALSE
+primary_ap_app,             ,   3672k, code,TRUE,FALSE
+ota,                        ,   2940K, data,TRUE,TRUE
+ota_mgr,                    ,   8K,    data,TRUE,TRUE
+usr_config,                 ,   8K,    data,TRUE,TRUE
+tuya_data,          0x7cd000,   196K,  data,TRUE,TRUE
+sys_rf,             0x7fe000,   4k,    data,TRUE,TRUE
+sys_net,            0x7ff000,   4k,    data,TRUE,TRUE
