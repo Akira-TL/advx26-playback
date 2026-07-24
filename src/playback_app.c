@@ -117,9 +117,17 @@ static size_t playback_app_speaker_probe_read_pcm(
 )
 {
     (void)context;
-    (void)destination;
-    (void)frame_capacity;
-    return 0U;
+
+    if ((destination == NULL) || (frame_capacity == 0U))
+    {
+        return 0U;
+    }
+    memset(
+        destination,
+        0,
+        frame_capacity * 2U * sizeof(*destination)
+    );
+    return frame_capacity;
 }
 
 static void playback_app_speaker_probe_status_callback(
@@ -143,21 +151,26 @@ static void playback_app_speaker_probe_status_callback(
             );
             break;
         case PLAYBACK_SPEAKER_CONNECTED:
+            mob_screen_show_bluetooth_status(
+                PLAYBACK_BLUETOOTH_BROWSER_CONNECTED,
+                status->target_address,
+                "A2DP connected; starting silent keepalive"
+            );
+            break;
         case PLAYBACK_SPEAKER_STREAMING:
             mob_screen_show_bluetooth_status(
                 PLAYBACK_BLUETOOTH_BROWSER_PAIRED,
                 status->target_address,
-                "A2DP audio connected"
+                "A2DP connected; silent keepalive active"
             );
             break;
         case PLAYBACK_SPEAKER_DISCONNECTED:
-            if (status->desired_connected &&
-                (status->last_result != PLAYBACK_SPEAKER_LINK_OK))
+            if (status->desired_connected)
             {
                 mob_screen_show_bluetooth_status(
-                    PLAYBACK_BLUETOOTH_BROWSER_FAILED,
+                    PLAYBACK_BLUETOOTH_BROWSER_CONNECTING,
                     status->target_address,
-                    playback_speaker_link_result_name(status->last_result)
+                    "A2DP disconnected; reconnecting"
                 );
             }
             break;
@@ -253,7 +266,7 @@ static void playback_app_bluetooth_connect_callback(
     );
     if (speaker_result == PLAYBACK_SPEAKER_LINK_OK)
     {
-        speaker_result = playback_speaker_link_connect(&state->speaker_probe);
+        speaker_result = playback_speaker_link_start(&state->speaker_probe);
     }
     if (speaker_result != PLAYBACK_SPEAKER_LINK_OK)
     {

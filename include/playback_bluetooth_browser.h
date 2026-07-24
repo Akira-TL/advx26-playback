@@ -31,6 +31,7 @@ typedef struct
     int8_t rssi;
     uint32_t class_of_device;
     bool audio_device;
+    bool name_resolved;
 } playback_bluetooth_browser_device_t;
 
 typedef void (*playback_bluetooth_browser_devices_cb)(

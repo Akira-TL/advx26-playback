@@ -28,6 +28,8 @@ typedef struct
     bk_bt_linkkey_storage_t link_key;
     bool has_link_key;
     bool scanning;
+    bool remote_name_query_active;
+    uint8_t remote_name_query_address[PLAYBACK_BLUETOOTH_ADDRESS_BYTES];
     volatile bool closing;
 } playback_bluetooth_browser_state_t;
 
@@ -174,6 +176,111 @@ static void playback_bluetooth_publish_status(
     }
 }
 
+static void playback_bluetooth_start_next_name_query(
+    playback_bluetooth_browser_state_t *state
+)
+{
+    uint8_t address[PLAYBACK_BLUETOOTH_ADDRESS_BYTES];
+    size_t index;
+
+    for (;;)
+    {
+        bool found = false;
+
+        tal_mutex_lock(state->mutex);
+        if (state->closing || state->scanning || state->remote_name_query_active)
+        {
+            tal_mutex_unlock(state->mutex);
+            return;
+        }
+        for (index = 0U; index < state->device_count; ++index)
+        {
+            if (!state->devices[index].name_resolved)
+            {
+                memcpy(address, state->devices[index].address, sizeof(address));
+                memcpy(
+                    state->remote_name_query_address,
+                    address,
+                    sizeof(state->remote_name_query_address)
+                );
+                state->remote_name_query_active = true;
+                found = true;
+                break;
+            }
+        }
+        tal_mutex_unlock(state->mutex);
+
+        if (!found)
+        {
+            return;
+        }
+        if (bk_bt_gap_read_remote_name(address) == BK_OK)
+        {
+            return;
+        }
+
+        tal_mutex_lock(state->mutex);
+        state->remote_name_query_active = false;
+        for (index = 0U; index < state->device_count; ++index)
+        {
+            if (playback_bluetooth_address_equal(state->devices[index].address, address))
+            {
+                state->devices[index].name_resolved = true;
+                break;
+            }
+        }
+        tal_mutex_unlock(state->mutex);
+        playback_bluetooth_publish_devices(state);
+    }
+}
+
+static void playback_bluetooth_apply_remote_name(
+    playback_bluetooth_browser_state_t *state,
+    const bk_bt_gap_cb_param_t *parameter
+)
+{
+    size_t index;
+
+    tal_mutex_lock(state->mutex);
+    state->remote_name_query_active = false;
+    memset(
+        state->remote_name_query_address,
+        0,
+        sizeof(state->remote_name_query_address)
+    );
+    for (index = 0U; index < state->device_count; ++index)
+    {
+        playback_bluetooth_browser_device_t *device = &state->devices[index];
+
+        if (!playback_bluetooth_address_equal(
+                device->address,
+                parameter->read_rmt_name.bda
+            ))
+        {
+            continue;
+        }
+        if ((parameter->read_rmt_name.stat == BK_BT_STATUS_SUCCESS) &&
+            (parameter->read_rmt_name.rmt_name[0] != '\0'))
+        {
+            playback_bluetooth_copy_name(
+                device->name,
+                sizeof(device->name),
+                parameter->read_rmt_name.rmt_name,
+                strnlen(
+                    (const char *)parameter->read_rmt_name.rmt_name,
+                    BK_BT_GAP_MAX_BDNAME_LEN
+                )
+            );
+        }
+        device->name_resolved = true;
+        break;
+    }
+    tal_mutex_unlock(state->mutex);
+
+    playback_bluetooth_publish_devices(state);
+    playback_bluetooth_start_next_name_query(state);
+}
+
 static void playback_bluetooth_update_device(
     playback_bluetooth_browser_state_t *state,
     const bk_bt_gap_cb_param_t *parameter
@@ -234,7 +341,8 @@ static void playback_bluetooth_update_device(
         }
     }
 
-    if (discovered.name[0] == '\0')
+    discovered.name_resolved = discovered.name[0] != '\0';
+    if (!discovered.name_resolved)
     {
         snprintf(
             discovered.name,
@@ -269,6 +377,11 @@ static void playback_bluetooth_update_device(
             tal_mutex_unlock(state->mutex);
             return;
         }
+    }
+    if (destination->name_resolved && !discovered.name_resolved)
+    {
+        memcpy(discovered.name, destination->name, sizeof(discovered.name));
+        discovered.name_resolved = true;
     }
     *destination = discovered;
     playback_bluetooth_sort_devices(state);
@@ -319,6 +432,14 @@ static void playback_bluetooth_gap_callback(
                 );
             }
             playback_bluetooth_publish_devices(state);
+            if (!state->scanning)
+            {
+                playback_bluetooth_start_next_name_query(state);
+            }
+            break;
+
+        case BK_BT_GAP_READ_REMOTE_NAME_EVT:
+            playback_bluetooth_apply_remote_name(state, parameter);
             break;
 
         case BK_BT_GAP_PIN_REQ_EVT:
