@@ -13,6 +13,7 @@
 #include "lv_vendor.h"
 #include "lvgl.h"
 #include "mob_screen.h"
+#include "playback_bluetooth_browser.h"
 #include "playback_board_link_gatt.h"
 #include "playback_engine.h"
 #include "playback_network.h"
@@ -39,11 +40,13 @@ typedef struct
 {
     playback_board_link_gatt_t gatt;
     playback_engine_t engine;
+    playback_bluetooth_browser_t bluetooth_browser;
+    playback_speaker_link_t speaker_probe;
     bool started;
 } playback_app_state_t;
 
 static playback_app_state_t playback_app_state;
-static const uint8_t playback_app_speaker_address[PLAYBACK_SPEAKER_LINK_ADDRESS_BYTES] =
+static uint8_t playback_app_speaker_address[PLAYBACK_SPEAKER_LINK_ADDRESS_BYTES] =
     DEMO_SPEAKER_ADDRESS;
 static const char *const playback_app_authorization = DEMO_PLAYBACK_AUTHORIZATION;
 
@@ -94,6 +97,172 @@ static bool playback_app_speaker_configured(void)
         value |= playback_app_speaker_address[index];
     }
     return value != 0U;
+}
+
+static void playback_app_bluetooth_devices_callback(
+    void *context,
+    const playback_bluetooth_browser_device_t *devices,
+    size_t device_count,
+    bool scanning
+)
+{
+    (void)context;
+    mob_screen_show_bluetooth_devices(devices, device_count, scanning);
+}
+
+static size_t playback_app_speaker_probe_read_pcm(
+    void *context,
+    int16_t *destination,
+    size_t frame_capacity
+)
+{
+    (void)context;
+    (void)destination;
+    (void)frame_capacity;
+    return 0U;
+}
+
+static void playback_app_speaker_probe_status_callback(
+    void *context,
+    const playback_speaker_link_status_t *status
+)
+{
+    (void)context;
+
+    if (status == NULL)
+    {
+        return;
+    }
+    switch (status->state)
+    {
+        case PLAYBACK_SPEAKER_CONNECTING:
+            mob_screen_show_bluetooth_status(
+                PLAYBACK_BLUETOOTH_BROWSER_CONNECTING,
+                status->target_address,
+                "Opening A2DP audio profile"
+            );
+            break;
+        case PLAYBACK_SPEAKER_CONNECTED:
+        case PLAYBACK_SPEAKER_STREAMING:
+            mob_screen_show_bluetooth_status(
+                PLAYBACK_BLUETOOTH_BROWSER_PAIRED,
+                status->target_address,
+                "A2DP audio connected"
+            );
+            break;
+        case PLAYBACK_SPEAKER_DISCONNECTED:
+            if (status->desired_connected &&
+                (status->last_result != PLAYBACK_SPEAKER_LINK_OK))
+            {
+                mob_screen_show_bluetooth_status(
+                    PLAYBACK_BLUETOOTH_BROWSER_FAILED,
+                    status->target_address,
+                    playback_speaker_link_result_name(status->last_result)
+                );
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+static void playback_app_close_speaker_probe(playback_app_state_t *state)
+{
+    if ((state != NULL) && (state->speaker_probe.state != NULL))
+    {
+        playback_speaker_link_close(&state->speaker_probe);
+    }
+}
+
+static void playback_app_bluetooth_status_callback(
+    void *context,
+    playback_bluetooth_browser_status_t status,
+    const uint8_t address[PLAYBACK_BLUETOOTH_ADDRESS_BYTES],
+    const char *detail
+)
+{
+    (void)context;
+    mob_screen_show_bluetooth_status(status, address, detail);
+    PR_NOTICE(
+        "Bluetooth browser status=%s detail=%s",
+        playback_bluetooth_browser_status_name(status),
+        detail != NULL ? detail : ""
+    );
+}
+
+static void playback_app_bluetooth_scan_callback(void *context)
+{
+    playback_app_state_t *state = context;
+
+    if ((state == NULL) ||
+        !playback_bluetooth_browser_start_scan(&state->bluetooth_browser))
+    {
+        PR_WARN("Bluetooth scanner is not ready");
+    }
+}
+
+static void playback_app_bluetooth_connect_callback(
+    void *context,
+    const uint8_t address[PLAYBACK_BLUETOOTH_ADDRESS_BYTES]
+)
+{
+    playback_app_state_t *state = context;
+    playback_engine_result_t engine_result;
+    playback_speaker_link_config_t speaker_config;
+    playback_speaker_link_result_t speaker_result;
+
+    if ((state == NULL) || (address == NULL))
+    {
+        return;
+    }
+    memcpy(
+        playback_app_speaker_address,
+        address,
+        sizeof(playback_app_speaker_address)
+    );
+    engine_result = playback_engine_set_speaker_address(&state->engine, address);
+    if (engine_result != PLAYBACK_ENGINE_OK)
+    {
+        PR_WARN(
+            "Unable to select Bluetooth speaker: %s",
+            playback_engine_result_name(engine_result)
+        );
+        return;
+    }
+    if (!playback_bluetooth_browser_connect(&state->bluetooth_browser, address))
+    {
+        PR_WARN("Unable to select Bluetooth speaker");
+        return;
+    }
+
+    playback_app_close_speaker_probe(state);
+    memset(&speaker_config, 0, sizeof(speaker_config));
+    memcpy(
+        speaker_config.target_address,
+        address,
+        sizeof(speaker_config.target_address)
+    );
+    speaker_config.sample_rate = PLAYBACK_SPEAKER_LINK_SAMPLE_RATE;
+    speaker_config.channels = 2U;
+    speaker_config.read_pcm = playback_app_speaker_probe_read_pcm;
+    speaker_config.on_status = playback_app_speaker_probe_status_callback;
+    speaker_config.context = state;
+    speaker_result = playback_speaker_link_init(
+        &state->speaker_probe,
+        &speaker_config
+    );
+    if (speaker_result == PLAYBACK_SPEAKER_LINK_OK)
+    {
+        speaker_result = playback_speaker_link_connect(&state->speaker_probe);
+    }
+    if (speaker_result != PLAYBACK_SPEAKER_LINK_OK)
+    {
+        PR_WARN(
+            "Bluetooth A2DP probe failed: %s",
+            playback_speaker_link_result_name(speaker_result)
+        );
+        playback_app_close_speaker_probe(state);
+    }
 }
 
 static void playback_app_show_report(const playback_report_t *report)
@@ -170,6 +339,10 @@ static void playback_app_command_callback(
         return;
     }
 
+    if (command->kind == PLAYBACK_COMMAND_LOAD_SESSION)
+    {
+        playback_app_close_speaker_probe(state);
+    }
     result = playback_engine_submit(&state->engine, command);
     if (result != PLAYBACK_ENGINE_OK)
     {
@@ -215,6 +388,8 @@ OPERATE_RET playback_app_start(void)
     playback_board_link_gatt_config_t gatt_config;
     playback_board_link_gatt_status_t gatt_status;
     playback_engine_config_t engine_config;
+    playback_bluetooth_browser_config_t bluetooth_config;
+    mob_screen_bluetooth_callbacks_t screen_bluetooth_callbacks;
     playback_board_link_gatt_result_t gatt_result;
     playback_engine_result_t engine_result;
     OPERATE_RET result;
@@ -235,6 +410,11 @@ OPERATE_RET playback_app_start(void)
     }
 
     board_register_hardware();
+    memset(&screen_bluetooth_callbacks, 0, sizeof(screen_bluetooth_callbacks));
+    screen_bluetooth_callbacks.on_scan = playback_app_bluetooth_scan_callback;
+    screen_bluetooth_callbacks.on_connect = playback_app_bluetooth_connect_callback;
+    screen_bluetooth_callbacks.context = &playback_app_state;
+    mob_screen_set_bluetooth_callbacks(&screen_bluetooth_callbacks);
     lv_vendor_init(DISPLAY_NAME);
     lv_vendor_disp_lock();
     mob_screen_create();
@@ -310,6 +490,23 @@ OPERATE_RET playback_app_start(void)
         return OPRT_COM_ERROR;
     }
 
+    memset(&bluetooth_config, 0, sizeof(bluetooth_config));
+    bluetooth_config.on_devices = playback_app_bluetooth_devices_callback;
+    bluetooth_config.on_status = playback_app_bluetooth_status_callback;
+    bluetooth_config.context = &playback_app_state;
+    if (!playback_bluetooth_browser_init(
+            &playback_app_state.bluetooth_browser,
+            &bluetooth_config
+        ))
+    {
+        PR_WARN("Classic Bluetooth browser initialization failed");
+        mob_screen_show_bluetooth_status(
+            PLAYBACK_BLUETOOTH_BROWSER_FAILED,
+            NULL,
+            "Classic Bluetooth initialization failed"
+        );
+    }
+
     playback_app_state.started = true;
     mob_screen_show_state(PLAYBACK_STATE_IDLE, NULL);
     if (!playback_app_speaker_configured())
@@ -345,6 +542,8 @@ void playback_app_stop(void)
         return;
     }
 
+    playback_app_close_speaker_probe(&playback_app_state);
+    playback_bluetooth_browser_close(&playback_app_state.bluetooth_browser);
     playback_engine_close(&playback_app_state.engine);
     playback_board_link_gatt_close(&playback_app_state.gatt);
     playback_app_state.started = false;

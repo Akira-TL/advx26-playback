@@ -550,6 +550,7 @@ static bool playback_engine_handle_load(
     playback_audio_index_t index;
     playback_audio_index_record_t *records = NULL;
     playback_media_scheduler_result_t scheduler_result;
+    playback_media_scheduler_config_t scheduler_config;
     playback_engine_result_t index_result;
     playback_error_t load_error;
 
@@ -584,11 +585,14 @@ static bool playback_engine_handle_load(
         return true;
     }
 
+    tal_mutex_lock(state->snapshot_mutex);
+    scheduler_config = state->config.scheduler;
+    tal_mutex_unlock(state->snapshot_mutex);
     scheduler_result = playback_media_scheduler_prepare(
         &state->scheduler,
         package,
         &index,
-        &state->config.scheduler
+        &scheduler_config
     );
     tal_psram_free(records);
     if (scheduler_result != PLAYBACK_SCHEDULER_OK)
@@ -1086,6 +1090,45 @@ playback_engine_result_t playback_engine_get_snapshot(
         return PLAYBACK_ENGINE_NOT_INITIALIZED;
     }
     playback_engine_snapshot_copy(engine->state, snapshot);
+    return PLAYBACK_ENGINE_OK;
+}
+
+playback_engine_result_t playback_engine_set_speaker_address(
+    playback_engine_t *engine,
+    const uint8_t address[PLAYBACK_SPEAKER_LINK_ADDRESS_BYTES]
+)
+{
+    playback_engine_state_t *state;
+    uint8_t index;
+    uint8_t any_nonzero = 0U;
+    uint8_t any_not_ff = 0U;
+
+    if ((engine == NULL) || (address == NULL))
+    {
+        return PLAYBACK_ENGINE_INVALID_ARGUMENT;
+    }
+    if (engine->state == NULL)
+    {
+        return PLAYBACK_ENGINE_NOT_INITIALIZED;
+    }
+    for (index = 0U; index < PLAYBACK_SPEAKER_LINK_ADDRESS_BYTES; ++index)
+    {
+        any_nonzero |= address[index];
+        any_not_ff |= (uint8_t)(address[index] ^ 0xFFU);
+    }
+    if ((any_nonzero == 0U) || (any_not_ff == 0U))
+    {
+        return PLAYBACK_ENGINE_INVALID_ARGUMENT;
+    }
+
+    state = engine->state;
+    tal_mutex_lock(state->snapshot_mutex);
+    memcpy(
+        state->config.scheduler.speaker_address,
+        address,
+        sizeof(state->config.scheduler.speaker_address)
+    );
+    tal_mutex_unlock(state->snapshot_mutex);
     return PLAYBACK_ENGINE_OK;
 }
 
