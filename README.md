@@ -43,3 +43,20 @@ tos.py build
 ```
 
 Generated `.build/` and `dist/` content is local only.
+
+## Host-side BLE smoke test
+
+The Playback UI remains idle until a Board Link `LOAD_SESSION` command arrives. A host-side client can verify advertising, HELLO negotiation, notifications, and command handling without the Trigger Board:
+
+```bash
+cd /home/akira/Projects/advx26/firmware/playback
+uv run --with bleak tools/playback_ble_test.py status
+```
+
+To send a complete Board Link command document, including `LOAD_SESSION`:
+
+```bash
+uv run --with bleak tools/playback_ble_test.py send /path/to/command.json
+```
+
+Use `--address XX:XX:XX:XX:XX:XX` when BlueZ does not expose the scan-response name. Keep the serial log open while testing; successful startup includes `Playback application ready`, and BLE connection changes are logged as `Board Link connected=...`.
