@@ -88,7 +88,6 @@ typedef struct
     SbcEncoderContext encoder;
     int16_t encode_pcm[PLAYBACK_SPEAKER_SBC_MAX_PCM_SAMPLES];
     bool encoder_ready;
-    bool source_init_requested;
     bool closing;
     playback_speaker_media_request_t media_request;
     uint32_t media_request_ms;
@@ -99,6 +98,8 @@ typedef struct
 
 static playback_speaker_link_state_t *playback_speaker_active_state = NULL;
 static MUTEX_HANDLE playback_speaker_callback_mutex = NULL;
+static bool playback_speaker_source_initialized = false;
+static bool playback_speaker_source_profile_ready = false;
 
 static bool playback_speaker_time_reached(uint32_t now, uint32_t deadline)
 {
@@ -217,6 +218,16 @@ static void playback_speaker_a2dp_callback(
     if (parameter == NULL)
     {
         return;
+    }
+    if ((event_kind == BK_A2DP_PROF_STATE_EVT) &&
+        (parameter->a2dp_prof_stat.role == 0U) &&
+        (playback_speaker_callback_mutex != NULL))
+    {
+        tal_mutex_lock(playback_speaker_callback_mutex);
+        playback_speaker_source_profile_ready =
+            (parameter->a2dp_prof_stat.action == 0U) &&
+            (parameter->a2dp_prof_stat.status == 0U);
+        tal_mutex_unlock(playback_speaker_callback_mutex);
     }
     state = playback_speaker_callback_enter();
     if (state == NULL)
@@ -1183,6 +1194,56 @@ static playback_speaker_link_result_t playback_speaker_set_desired(
     return playback_speaker_enqueue(state, &event);
 }
 
+playback_speaker_link_result_t playback_speaker_link_prepare(void)
+{
+    int32_t platform_result;
+
+    if ((playback_speaker_callback_mutex == NULL) &&
+        (tal_mutex_create_init(&playback_speaker_callback_mutex) != OPRT_OK))
+    {
+        return PLAYBACK_SPEAKER_LINK_NO_MEMORY;
+    }
+
+    tal_mutex_lock(playback_speaker_callback_mutex);
+    if (playback_speaker_source_initialized)
+    {
+        tal_mutex_unlock(playback_speaker_callback_mutex);
+        return PLAYBACK_SPEAKER_LINK_OK;
+    }
+    tal_mutex_unlock(playback_speaker_callback_mutex);
+
+    platform_result = bk_bt_a2dp_register_callback(playback_speaker_a2dp_callback);
+    if (platform_result == 0)
+    {
+        platform_result = bk_a2dp_source_register_data_callback(playback_speaker_data_callback);
+    }
+    if (platform_result == 0)
+    {
+        platform_result = bk_a2dp_source_register_pcm_encode_callback(
+            playback_speaker_encode_callback
+        );
+    }
+    if (platform_result == 0)
+    {
+        platform_result = bk_a2dp_source_register_pcm_resample_callback(
+            playback_speaker_resample_callback
+        );
+    }
+    if (platform_result == 0)
+    {
+        platform_result = bk_bt_a2dp_source_init();
+    }
+    if (platform_result != 0)
+    {
+        return PLAYBACK_SPEAKER_LINK_PLATFORM_ERROR;
+    }
+
+    tal_mutex_lock(playback_speaker_callback_mutex);
+    playback_speaker_source_initialized = true;
+    tal_mutex_unlock(playback_speaker_callback_mutex);
+    return PLAYBACK_SPEAKER_LINK_OK;
+}
+
 playback_speaker_link_result_t playback_speaker_link_init(
     playback_speaker_link_t *link,
     const playback_speaker_link_config_t *config
@@ -1191,7 +1252,7 @@ playback_speaker_link_result_t playback_speaker_link_init(
     playback_speaker_link_state_t *state;
     THREAD_CFG_T worker_config;
     playback_speaker_event_t wake_event;
-    int32_t platform_result;
+    playback_speaker_link_result_t prepare_result;
 
     if ((link == NULL) || (config == NULL) || (config->read_pcm == NULL) ||
         !playback_speaker_address_valid(config->target_address) ||
@@ -1204,10 +1265,10 @@ playback_speaker_link_result_t playback_speaker_link_init(
     {
         return PLAYBACK_SPEAKER_LINK_ALREADY_INITIALIZED;
     }
-    if ((playback_speaker_callback_mutex == NULL) &&
-        (tal_mutex_create_init(&playback_speaker_callback_mutex) != OPRT_OK))
+    prepare_result = playback_speaker_link_prepare();
+    if (prepare_result != PLAYBACK_SPEAKER_LINK_OK)
     {
-        return PLAYBACK_SPEAKER_LINK_NO_MEMORY;
+        return prepare_result;
     }
 
     state = tal_psram_calloc(1U, sizeof(*state));
@@ -1218,6 +1279,9 @@ playback_speaker_link_result_t playback_speaker_link_init(
     state->config = *config;
     state->reconnect_delay_ms = PLAYBACK_SPEAKER_RECONNECT_INITIAL_MS;
     state->status.initialized = true;
+    tal_mutex_lock(playback_speaker_callback_mutex);
+    state->status.profile_ready = playback_speaker_source_profile_ready;
+    tal_mutex_unlock(playback_speaker_callback_mutex);
     state->status.state = PLAYBACK_SPEAKER_DISCONNECTED;
     state->status.input_sample_rate = config->sample_rate;
     state->status.input_channels = config->channels;
@@ -1264,46 +1328,20 @@ playback_speaker_link_result_t playback_speaker_link_init(
     tal_mutex_unlock(playback_speaker_callback_mutex);
     link->state = state;
 
-    platform_result = bk_bt_a2dp_register_callback(playback_speaker_a2dp_callback);
-    if (platform_result == 0)
-    {
-        platform_result = bk_a2dp_source_register_data_callback(playback_speaker_data_callback);
-    }
-    if (platform_result == 0)
-    {
-        platform_result = bk_a2dp_source_set_pcm_data_format(
+    if (bk_a2dp_source_set_pcm_data_format(
             config->sample_rate,
             PLAYBACK_SPEAKER_LINK_BITS_PER_SAMPLE,
             config->channels
-        );
-    }
-    if (platform_result == 0)
-    {
-        platform_result = bk_a2dp_source_register_pcm_encode_callback(
-            playback_speaker_encode_callback
-        );
-    }
-    if (platform_result == 0)
-    {
-        platform_result = bk_a2dp_source_register_pcm_resample_callback(
-            playback_speaker_resample_callback
-        );
-    }
-    if (platform_result == 0)
-    {
-        platform_result = bk_bt_a2dp_source_init();
-    }
-    if (platform_result != 0)
+        ) != 0)
     {
         playback_speaker_set_error(
             state,
             PLAYBACK_SPEAKER_LINK_PLATFORM_ERROR,
-            platform_result
+            PLAYBACK_SPEAKER_INVALID_PLATFORM_ERROR
         );
         playback_speaker_link_close(link);
         return PLAYBACK_SPEAKER_LINK_PLATFORM_ERROR;
     }
-    state->source_init_requested = true;
 
     memset(&wake_event, 0, sizeof(wake_event));
     wake_event.kind = PLAYBACK_SPEAKER_EVENT_WAKE;
@@ -1433,12 +1471,6 @@ void playback_speaker_link_close(playback_speaker_link_t *link)
     {
         (void)bk_bt_a2dp_source_disconnect(state->config.target_address);
     }
-    if (state->source_init_requested)
-    {
-        (void)bk_bt_a2dp_source_deinit();
-        state->source_init_requested = false;
-    }
-
     memset(&stop_event, 0, sizeof(stop_event));
     stop_event.kind = PLAYBACK_SPEAKER_EVENT_STOP;
     (void)tal_queue_post(state->event_queue, &stop_event, QUEUE_WAIT_FOREVER);

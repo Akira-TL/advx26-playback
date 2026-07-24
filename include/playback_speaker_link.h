@@ -96,6 +96,13 @@ typedef struct
     void *state;
 } playback_speaker_link_t;
 
+/**
+ * Initialize the shared A2DP source host once before the BLE Board Link starts.
+ * Later Speaker Link instances reuse the prepared host without resetting the
+ * dual-mode Bluetooth controller.
+ */
+playback_speaker_link_result_t playback_speaker_link_prepare(void);
+
 playback_speaker_link_result_t playback_speaker_link_init(
     playback_speaker_link_t *link,
     const playback_speaker_link_config_t *config

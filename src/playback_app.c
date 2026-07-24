@@ -405,6 +405,7 @@ OPERATE_RET playback_app_start(void)
     mob_screen_bluetooth_callbacks_t screen_bluetooth_callbacks;
     playback_board_link_gatt_result_t gatt_result;
     playback_engine_result_t engine_result;
+    playback_speaker_link_result_t speaker_result;
     OPERATE_RET result;
 
     if (playback_app_state.started)
@@ -442,6 +443,22 @@ OPERATE_RET playback_app_start(void)
         mob_screen_show_state(PLAYBACK_STATE_ERROR, "Wi-Fi initialization failed");
         return result;
     }
+
+    speaker_result = playback_speaker_link_prepare();
+    if (speaker_result != PLAYBACK_SPEAKER_LINK_OK)
+    {
+        PR_ERR(
+            "A2DP source preparation failed before BLE start: %s",
+            playback_speaker_link_result_name(speaker_result)
+        );
+        mob_screen_show_bluetooth_status(
+            PLAYBACK_BLUETOOTH_BROWSER_FAILED,
+            NULL,
+            "A2DP initialization failed"
+        );
+        return OPRT_COM_ERROR;
+    }
+    PR_NOTICE("A2DP source prepared before BLE Board Link startup");
 
     memset(&gatt_config, 0, sizeof(gatt_config));
     gatt_config.on_command = playback_app_command_callback;
