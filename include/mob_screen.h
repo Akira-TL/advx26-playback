@@ -14,6 +14,9 @@ extern "C" {
  */
 void mob_screen_create(void);
 
+/** Show a minimal output-only state screen without disturbing paused/completed video. */
+void mob_screen_show_state(playback_state_t state, const char *diagnostic);
+
 /**
  * @brief Present a contiguous native-endian RGB565 surface through LVGL.
  *

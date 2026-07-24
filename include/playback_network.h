@@ -3,10 +3,7 @@
 
 #include "tuya_cloud_types.h"
 
-/**
- * Initialize the demo Wi-Fi connection and fetch the configured video once the
- * network link is ready.
- */
+/** Initialize the fixed runtime Wi-Fi connection used by media Range reads. */
 OPERATE_RET playback_network_start(void);
 
 #endif /* PLAYBACK_NETWORK_H */
