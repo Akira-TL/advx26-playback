@@ -14,6 +14,7 @@
 #include "tal_api.h"
 
 #define PLAYBACK_SCHEDULER_VIDEO_PREROLL_FRAMES (2U)
+#define PLAYBACK_SCHEDULER_MAX_GOP_RECOVERY_FAILURES (2U)
 #define PLAYBACK_SCHEDULER_ANNEX_B_OVERHEAD_BYTES (4U * PLAYBACK_MP4_MAX_NALS_PER_ACCESS_UNIT)
 
 typedef struct
@@ -47,6 +48,8 @@ typedef struct
     uint8_t video_count;
     uint32_t next_video_sample;
     uint32_t dropped_video_frames;
+    uint8_t h264_recovery_failures;
+    bool h264_recovery_active;
     bool video_exhausted;
     bool seeking;
     uint64_t seek_target_ticks;
@@ -247,6 +250,109 @@ static bool playback_scheduler_copy_frame(
     return true;
 }
 
+static bool playback_scheduler_h264_recoverable(playback_h264_result_t result)
+{
+    return (result == PLAYBACK_H264_DECODE_FAILED) ||
+           (result == PLAYBACK_H264_OUTPUT_INVALID) ||
+           (result == PLAYBACK_H264_RESET_REQUIRED) ||
+           (result == PLAYBACK_H264_NEED_SYNC);
+}
+
+static playback_media_scheduler_result_t playback_scheduler_recover_h264(
+    playback_media_scheduler_state_t *state,
+    const playback_mp4_sample_t *failed_sample,
+    playback_h264_result_t failure
+)
+{
+    playback_mp4_sample_t sync_sample;
+    playback_mp4_result_t mp4_result;
+    playback_h264_result_t reset_result;
+    uint64_t maximum_gap_ticks;
+    uint32_t sample_index;
+
+    if (!playback_scheduler_h264_recoverable(failure))
+    {
+        return playback_scheduler_fail(
+            state,
+            PLAYBACK_SCHEDULER_VIDEO_FAILED,
+            playback_h264_result_to_error(failure)
+        );
+    }
+
+    state->h264_recovery_failures = state->h264_recovery_active
+                                        ? (uint8_t)(state->h264_recovery_failures + 1U)
+                                        : 1U;
+    if (state->h264_recovery_failures >= PLAYBACK_SCHEDULER_MAX_GOP_RECOVERY_FAILURES)
+    {
+        return playback_scheduler_fail(
+            state,
+            PLAYBACK_SCHEDULER_VIDEO_FAILED,
+            PLAYBACK_ERROR_H264_DECODE_FAILED
+        );
+    }
+
+    maximum_gap_ticks =
+        ((uint64_t)state->package.session.video.max_keyframe_interval_ms *
+         state->codec.timescale) /
+        1000ULL;
+    for (sample_index = failed_sample->index + 1U;
+         sample_index < state->codec.sample_count;
+         ++sample_index)
+    {
+        mp4_result = playback_mp4_demux_get_sample(
+            &state->demux,
+            sample_index,
+            &sync_sample
+        );
+        if (mp4_result != PLAYBACK_MP4_OK)
+        {
+            return playback_scheduler_fail(
+                state,
+                PLAYBACK_SCHEDULER_VIDEO_FAILED,
+                playback_mp4_result_to_error(mp4_result)
+            );
+        }
+        if (!sync_sample.is_sync)
+        {
+            continue;
+        }
+        if ((sync_sample.pts < failed_sample->pts) ||
+            ((sync_sample.pts - failed_sample->pts) > maximum_gap_ticks))
+        {
+            return playback_scheduler_fail(
+                state,
+                PLAYBACK_SCHEDULER_VIDEO_FAILED,
+                PLAYBACK_ERROR_H264_DECODE_FAILED
+            );
+        }
+
+        state->dropped_video_frames += state->video_count;
+        playback_scheduler_clear_video_queue(state);
+        reset_result = playback_h264_decoder_reset_at_sync(&state->decoder);
+        if (reset_result != PLAYBACK_H264_OK)
+        {
+            return playback_scheduler_fail(
+                state,
+                PLAYBACK_SCHEDULER_VIDEO_FAILED,
+                playback_h264_result_to_error(reset_result)
+            );
+        }
+        state->next_video_sample = sync_sample.index;
+        state->video_exhausted = false;
+        state->seeking = true;
+        state->seek_target_ticks =
+            ((uint64_t)state->position_ms * state->codec.timescale) / 1000ULL;
+        state->h264_recovery_active = true;
+        return PLAYBACK_SCHEDULER_OK;
+    }
+
+    return playback_scheduler_fail(
+        state,
+        PLAYBACK_SCHEDULER_VIDEO_FAILED,
+        PLAYBACK_ERROR_H264_DECODE_FAILED
+    );
+}
+
 static playback_media_scheduler_result_t playback_scheduler_decode_one(
     playback_media_scheduler_state_t *state
 )
@@ -299,11 +405,7 @@ static playback_media_scheduler_result_t playback_scheduler_decode_one(
     );
     if (h264_result != PLAYBACK_H264_OK)
     {
-        return playback_scheduler_fail(
-            state,
-            PLAYBACK_SCHEDULER_VIDEO_FAILED,
-            playback_h264_result_to_error(h264_result)
-        );
+        return playback_scheduler_recover_h264(state, &sample, h264_result);
     }
     h264_result = playback_h264_decoder_poll_frame(&state->decoder, &frame);
     if (h264_result != PLAYBACK_H264_OK)
@@ -344,6 +446,8 @@ static playback_media_scheduler_result_t playback_scheduler_decode_one(
         );
     }
 
+    state->h264_recovery_active = false;
+    state->h264_recovery_failures = 0U;
     state->next_video_sample++;
     if (state->next_video_sample >= state->codec.sample_count)
     {
@@ -824,6 +928,8 @@ playback_media_scheduler_result_t playback_media_scheduler_seek(
 
     playback_scheduler_clear_video_queue(state);
     state->next_video_sample = sync_sample.index;
+    state->h264_recovery_active = false;
+    state->h264_recovery_failures = 0U;
     state->video_exhausted = false;
     state->seeking = true;
     state->seek_target_ticks = ((uint64_t)position_ms * state->codec.timescale) / 1000ULL;
