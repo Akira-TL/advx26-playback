@@ -448,7 +448,7 @@ OPERATE_RET playback_app_start(void)
     if (speaker_result != PLAYBACK_SPEAKER_LINK_OK)
     {
         PR_ERR(
-            "A2DP source preparation failed before BLE start: %s",
+            "Beken dual-mode Bluetooth host preparation failed: %s",
             playback_speaker_link_result_name(speaker_result)
         );
         mob_screen_show_bluetooth_status(
@@ -458,7 +458,7 @@ OPERATE_RET playback_app_start(void)
         );
         return OPRT_COM_ERROR;
     }
-    PR_NOTICE("A2DP source prepared before BLE Board Link startup");
+    PR_NOTICE("Beken dual-mode Bluetooth host prepared for A2DP and Board Link");
 
     memset(&gatt_config, 0, sizeof(gatt_config));
     gatt_config.on_command = playback_app_command_callback;

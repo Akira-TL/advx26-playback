@@ -4,10 +4,10 @@
 #include <string.h>
 
 #include "tal_api.h"
-#include "tkl_bluetooth.h"
+#include <components/bluetooth/bk_ble.h>
 #include <components/bluetooth/bk_dm_bluetooth_types.h>
-#include <components/bluetooth/bk_dm_gap_ble_types.h>
-#include <components/bluetooth/bk_dm_gap_ble.h>
+#include <components/bluetooth/bk_dm_gatt_types.h>
+#include <components/bluetooth/bk_dm_gatts.h>
 
 #include "playback_board_link_json.h"
 #include "playback_board_link_wire.h"
@@ -17,10 +17,16 @@
 #define PLAYBACK_BOARD_LINK_GATT_WORKER_POLL_MS (500U)
 #define PLAYBACK_BOARD_LINK_GATT_ADV_INTERVAL_MIN (160U)
 #define PLAYBACK_BOARD_LINK_GATT_ADV_INTERVAL_MAX (320U)
-#define PLAYBACK_BOARD_LINK_GATT_COMMAND_CHAR_INDEX (0U)
-#define PLAYBACK_BOARD_LINK_GATT_REPORT_CHAR_INDEX (1U)
-#define PLAYBACK_BOARD_LINK_GATT_CHARACTERISTIC_COUNT (2U)
+#define PLAYBACK_BOARD_LINK_GATT_APP_ID (0x5042U)
+#define PLAYBACK_BOARD_LINK_GATT_ADV_INSTANCE (0U)
+#define PLAYBACK_BOARD_LINK_GATT_ATTR_SERVICE (0U)
+#define PLAYBACK_BOARD_LINK_GATT_ATTR_COMMAND (1U)
+#define PLAYBACK_BOARD_LINK_GATT_ATTR_REPORT (2U)
+#define PLAYBACK_BOARD_LINK_GATT_ATTR_REPORT_CCCD (3U)
+#define PLAYBACK_BOARD_LINK_GATT_ATTR_COUNT (4U)
+#define PLAYBACK_BOARD_LINK_GATT_MAX_ATTRIBUTE_COUNT (12U)
 #define PLAYBACK_BOARD_LINK_GATT_INVALID_CONNECTION (0xFFFFU)
+#define PLAYBACK_BOARD_LINK_GATT_INVALID_INTERFACE ((bk_gatt_if_t)0xFFU)
 
 static const uint8_t playback_board_link_service_uuid[16] = {
     0x51U, 0xC0U, 0x01U, 0x33U, 0xAFU, 0x80U, 0xA3U, 0x81U,
@@ -73,14 +79,29 @@ typedef struct
     uint8_t data[PLAYBACK_BOARD_LINK_GATT_ATT_VALUE_MAX];
 } playback_board_link_gatt_event_t;
 
+typedef enum
+{
+    PLAYBACK_BOARD_LINK_ADV_IDLE = 0,
+    PLAYBACK_BOARD_LINK_ADV_SETTING_PARAMS,
+    PLAYBACK_BOARD_LINK_ADV_SETTING_DATA,
+    PLAYBACK_BOARD_LINK_ADV_SETTING_SCAN_RESPONSE,
+    PLAYBACK_BOARD_LINK_ADV_STARTING,
+    PLAYBACK_BOARD_LINK_ADV_ACTIVE,
+    PLAYBACK_BOARD_LINK_ADV_STOPPING,
+} playback_board_link_adv_stage_t;
+
 typedef struct
 {
     playback_board_link_gatt_config_t config;
     playback_board_link_gatt_status_t status;
     playback_hello_t local_hello;
-    TKL_BLE_GATTS_PARAMS_T gatts;
-    TKL_BLE_SERVICE_PARAMS_T service;
-    TKL_BLE_CHAR_PARAMS_T characteristics[PLAYBACK_BOARD_LINK_GATT_CHARACTERISTIC_COUNT];
+    bk_gatts_attr_db_t attributes[PLAYBACK_BOARD_LINK_GATT_ATTR_COUNT];
+    uint16_t attribute_handles[PLAYBACK_BOARD_LINK_GATT_ATTR_COUNT];
+    uint8_t command_value[PLAYBACK_BOARD_LINK_GATT_ATT_VALUE_MAX];
+    uint8_t report_value[PLAYBACK_BOARD_LINK_GATT_ATT_VALUE_MAX];
+    uint16_t report_cccd;
+    bk_gatt_if_t gatts_if;
+    playback_board_link_adv_stage_t adv_stage;
     QUEUE_HANDLE event_queue;
     THREAD_HANDLE worker_thread;
     SEM_HANDLE worker_stopped;
@@ -92,12 +113,19 @@ typedef struct
     uint8_t report_fragment[PLAYBACK_BOARD_LINK_GATT_ATT_VALUE_MAX];
     uint32_t next_report_message_id;
     bool starting;
+    bool app_registered;
+    bool attribute_table_created;
     bool service_registered;
-    bool stack_initialized;
+    bool advertising_created;
     volatile bool closing;
 } playback_board_link_gatt_state_t;
 
 static playback_board_link_gatt_state_t *volatile playback_board_link_active_state = NULL;
+
+static void playback_board_link_gatt_adv_command_callback(
+    ble_cmd_t command,
+    ble_cmd_param_t *parameter
+);
 
 static size_t playback_board_link_gatt_bounded_string_length(const char *value, size_t capacity)
 {
@@ -236,104 +264,181 @@ static void playback_board_link_gatt_configure_hello(playback_board_link_gatt_st
     );
 }
 
+static void playback_board_link_gatt_uuid16(bk_bt_uuid_t *uuid, uint16_t value)
+{
+    memset(uuid, 0, sizeof(*uuid));
+    uuid->len = BK_UUID_LEN_16;
+    uuid->uuid.uuid16 = value;
+}
+
+static void playback_board_link_gatt_uuid128(
+    bk_bt_uuid_t *uuid,
+    const uint8_t value[BK_UUID_LEN_128]
+)
+{
+    memset(uuid, 0, sizeof(*uuid));
+    uuid->len = BK_UUID_LEN_128;
+    memcpy(uuid->uuid.uuid128, value, BK_UUID_LEN_128);
+}
+
 static void playback_board_link_gatt_configure_service(playback_board_link_gatt_state_t *state)
 {
-    memset(&state->gatts, 0, sizeof(state->gatts));
-    memset(&state->service, 0, sizeof(state->service));
-    memset(state->characteristics, 0, sizeof(state->characteristics));
+    bk_gatts_attr_db_t *attribute;
 
-    state->service.handle = TKL_BLE_GATT_INVALID_HANDLE;
-    state->service.svc_uuid.uuid_type = TKL_BLE_UUID_TYPE_128;
-    memcpy(
-        state->service.svc_uuid.uuid.uuid128,
-        playback_board_link_service_uuid,
-        sizeof(playback_board_link_service_uuid)
+    memset(state->attributes, 0, sizeof(state->attributes));
+    memset(state->attribute_handles, 0, sizeof(state->attribute_handles));
+    memset(state->command_value, 0, sizeof(state->command_value));
+    memset(state->report_value, 0, sizeof(state->report_value));
+    state->report_cccd = 0U;
+    state->gatts_if = PLAYBACK_BOARD_LINK_GATT_INVALID_INTERFACE;
+
+    attribute = &state->attributes[PLAYBACK_BOARD_LINK_GATT_ATTR_SERVICE];
+    playback_board_link_gatt_uuid16(
+        &attribute->att_desc.attr_type,
+        BK_GATT_UUID_PRI_SERVICE
     );
-    state->service.type = TKL_BLE_UUID_SERVICE_PRIMARY;
-    state->service.char_num = PLAYBACK_BOARD_LINK_GATT_CHARACTERISTIC_COUNT;
-    state->service.p_char = state->characteristics;
-
-    state->characteristics[PLAYBACK_BOARD_LINK_GATT_COMMAND_CHAR_INDEX].handle =
-        TKL_BLE_GATT_INVALID_HANDLE;
-    state->characteristics[PLAYBACK_BOARD_LINK_GATT_COMMAND_CHAR_INDEX].char_uuid.uuid_type =
-        TKL_BLE_UUID_TYPE_128;
-    memcpy(
-        state->characteristics[PLAYBACK_BOARD_LINK_GATT_COMMAND_CHAR_INDEX].char_uuid.uuid.uuid128,
-        playback_board_link_command_uuid,
-        sizeof(playback_board_link_command_uuid)
+    playback_board_link_gatt_uuid128(
+        &attribute->att_desc.attr_content,
+        playback_board_link_service_uuid
     );
-    state->characteristics[PLAYBACK_BOARD_LINK_GATT_COMMAND_CHAR_INDEX].property =
-        TKL_BLE_GATT_CHAR_PROP_WRITE;
-    state->characteristics[PLAYBACK_BOARD_LINK_GATT_COMMAND_CHAR_INDEX].permission =
-        TKL_BLE_GATT_PERM_WRITE;
-    state->characteristics[PLAYBACK_BOARD_LINK_GATT_COMMAND_CHAR_INDEX].value_len =
-        PLAYBACK_BOARD_LINK_GATT_ATT_VALUE_MAX;
 
-    state->characteristics[PLAYBACK_BOARD_LINK_GATT_REPORT_CHAR_INDEX].handle =
-        TKL_BLE_GATT_INVALID_HANDLE;
-    state->characteristics[PLAYBACK_BOARD_LINK_GATT_REPORT_CHAR_INDEX].char_uuid.uuid_type =
-        TKL_BLE_UUID_TYPE_128;
-    memcpy(
-        state->characteristics[PLAYBACK_BOARD_LINK_GATT_REPORT_CHAR_INDEX].char_uuid.uuid.uuid128,
-        playback_board_link_report_uuid,
-        sizeof(playback_board_link_report_uuid)
+    attribute = &state->attributes[PLAYBACK_BOARD_LINK_GATT_ATTR_COMMAND];
+    playback_board_link_gatt_uuid16(
+        &attribute->att_desc.attr_type,
+        BK_GATT_UUID_CHAR_DECLARE
     );
-    state->characteristics[PLAYBACK_BOARD_LINK_GATT_REPORT_CHAR_INDEX].property =
-        TKL_BLE_GATT_CHAR_PROP_NOTIFY;
-    state->characteristics[PLAYBACK_BOARD_LINK_GATT_REPORT_CHAR_INDEX].permission =
-        TKL_BLE_GATT_PERM_NONE;
-    state->characteristics[PLAYBACK_BOARD_LINK_GATT_REPORT_CHAR_INDEX].value_len =
-        PLAYBACK_BOARD_LINK_GATT_ATT_VALUE_MAX;
+    playback_board_link_gatt_uuid128(
+        &attribute->att_desc.attr_content,
+        playback_board_link_command_uuid
+    );
+    attribute->att_desc.value.attr_max_len = sizeof(state->command_value);
+    attribute->att_desc.value.attr_len = 0U;
+    attribute->att_desc.value.attr_value = state->command_value;
+    attribute->att_desc.prop =
+        BK_GATT_CHAR_PROP_BIT_WRITE | BK_GATT_CHAR_PROP_BIT_WRITE_NR;
+    attribute->att_desc.perm = BK_GATT_PERM_WRITE;
+    attribute->attr_control.auto_rsp = BK_GATT_AUTO_RSP;
 
-    state->gatts.svc_num = 1U;
-    state->gatts.p_service = &state->service;
+    attribute = &state->attributes[PLAYBACK_BOARD_LINK_GATT_ATTR_REPORT];
+    playback_board_link_gatt_uuid16(
+        &attribute->att_desc.attr_type,
+        BK_GATT_UUID_CHAR_DECLARE
+    );
+    playback_board_link_gatt_uuid128(
+        &attribute->att_desc.attr_content,
+        playback_board_link_report_uuid
+    );
+    attribute->att_desc.value.attr_max_len = sizeof(state->report_value);
+    attribute->att_desc.value.attr_len = 0U;
+    attribute->att_desc.value.attr_value = state->report_value;
+    attribute->att_desc.prop = BK_GATT_CHAR_PROP_BIT_NOTIFY;
+    attribute->att_desc.perm = BK_GATT_PERM_READ;
+    attribute->attr_control.auto_rsp = BK_GATT_AUTO_RSP;
+
+    attribute = &state->attributes[PLAYBACK_BOARD_LINK_GATT_ATTR_REPORT_CCCD];
+    playback_board_link_gatt_uuid16(
+        &attribute->att_desc.attr_type,
+        BK_GATT_UUID_CHAR_CLIENT_CONFIG
+    );
+    attribute->att_desc.value.attr_max_len = sizeof(state->report_cccd);
+    attribute->att_desc.value.attr_len = sizeof(state->report_cccd);
+    attribute->att_desc.value.attr_value = (uint8_t *)&state->report_cccd;
+    attribute->att_desc.perm = BK_GATT_PERM_READ | BK_GATT_PERM_WRITE;
+    attribute->attr_control.auto_rsp = BK_GATT_AUTO_RSP;
+}
+
+static void playback_board_link_gatt_set_adv_stage(
+    playback_board_link_gatt_state_t *state,
+    playback_board_link_adv_stage_t stage
+)
+{
+    tal_mutex_lock(state->status_mutex);
+    state->adv_stage = stage;
+    tal_mutex_unlock(state->status_mutex);
+}
+
+static playback_board_link_adv_stage_t playback_board_link_gatt_get_adv_stage(
+    playback_board_link_gatt_state_t *state
+)
+{
+    playback_board_link_adv_stage_t stage;
+
+    tal_mutex_lock(state->status_mutex);
+    stage = state->adv_stage;
+    tal_mutex_unlock(state->status_mutex);
+    return stage;
 }
 
 static OPERATE_RET playback_board_link_gatt_start_advertising(
     playback_board_link_gatt_state_t *state
 )
 {
-    TKL_BLE_DATA_T adv_data;
-    TKL_BLE_DATA_T scan_response;
-    TKL_BLE_GAP_ADV_PARAMS_T adv_params;
-    OPERATE_RET result;
+    ble_adv_param_t parameters;
     playback_board_link_gatt_status_t status;
+    ble_err_t result;
 
     playback_board_link_gatt_status_snapshot(state, &status);
-    if (!status.started || status.connected || status.advertising || state->closing)
+    if (!status.started || !state->service_registered || status.connected ||
+        status.advertising || state->closing ||
+        (playback_board_link_gatt_get_adv_stage(state) != PLAYBACK_BOARD_LINK_ADV_IDLE))
     {
         return OPRT_OK;
     }
 
-    memset(&adv_data, 0, sizeof(adv_data));
-    memset(&scan_response, 0, sizeof(scan_response));
-    memset(&adv_params, 0, sizeof(adv_params));
+    (void)bk_ble_appm_set_dev_name(
+        (uint8_t)strlen(PLAYBACK_BOARD_LINK_GATT_DEVICE_NAME),
+        (uint8_t *)PLAYBACK_BOARD_LINK_GATT_DEVICE_NAME
+    );
 
-    adv_data.length = sizeof(playback_board_link_adv_data);
-    adv_data.p_data = (uint8_t *)playback_board_link_adv_data;
-    scan_response.length = sizeof(playback_board_link_scan_response);
-    scan_response.p_data = (uint8_t *)playback_board_link_scan_response;
-
-    if (bk_ble_gap_set_device_name(PLAYBACK_BOARD_LINK_GATT_DEVICE_NAME) != 0)
+    if (state->advertising_created)
     {
+        playback_board_link_gatt_set_adv_stage(
+            state,
+            PLAYBACK_BOARD_LINK_ADV_STARTING
+        );
+        result = bk_ble_start_advertising(
+            PLAYBACK_BOARD_LINK_GATT_ADV_INSTANCE,
+            0U,
+            playback_board_link_gatt_adv_command_callback
+        );
+        if (result != BK_OK)
+        {
+            playback_board_link_gatt_set_adv_stage(
+                state,
+                PLAYBACK_BOARD_LINK_ADV_IDLE
+            );
+            return OPRT_COM_ERROR;
+        }
+        return OPRT_OK;
+    }
+
+    memset(&parameters, 0, sizeof(parameters));
+    parameters.own_addr_type = OWN_ADDR_TYPE_PUBLIC_ADDR;
+    parameters.adv_type = ADV_TYPE_LEGACY;
+    parameters.chnl_map = ADV_ALL_CHNLS;
+    parameters.adv_prop = ADV_PROP_CONNECTABLE_BIT |
+                          ADV_PROP_SCANNABLE_BIT |
+                          ADV_PROP_PROP_LEGACY_BIT;
+    parameters.adv_intv_min = PLAYBACK_BOARD_LINK_GATT_ADV_INTERVAL_MIN;
+    parameters.adv_intv_max = PLAYBACK_BOARD_LINK_GATT_ADV_INTERVAL_MAX;
+    parameters.prim_phy = PHY_TYPE_LE_1M;
+    parameters.second_phy = PHY_TYPE_LE_1M;
+
+    playback_board_link_gatt_set_adv_stage(
+        state,
+        PLAYBACK_BOARD_LINK_ADV_SETTING_PARAMS
+    );
+    result = bk_ble_create_advertising(
+        PLAYBACK_BOARD_LINK_GATT_ADV_INSTANCE,
+        &parameters,
+        playback_board_link_gatt_adv_command_callback
+    );
+    if (result != BK_OK)
+    {
+        playback_board_link_gatt_set_adv_stage(state, PLAYBACK_BOARD_LINK_ADV_IDLE);
         return OPRT_COM_ERROR;
     }
-    result = tkl_ble_gap_adv_rsp_data_set(&adv_data, &scan_response);
-    if (result != OPRT_OK)
-    {
-        return result;
-    }
-
-    adv_params.adv_type = TKL_BLE_GAP_ADV_TYPE_CONN_SCANNABLE_UNDIRECTED;
-    adv_params.adv_interval_min = PLAYBACK_BOARD_LINK_GATT_ADV_INTERVAL_MIN;
-    adv_params.adv_interval_max = PLAYBACK_BOARD_LINK_GATT_ADV_INTERVAL_MAX;
-    adv_params.adv_channel_map = 0x07U;
-    result = tkl_ble_gap_adv_start(&adv_params);
-    if (result == OPRT_OK)
-    {
-        playback_board_link_gatt_set_advertising(state, true);
-    }
-    return result;
+    return OPRT_OK;
 }
 
 static bool playback_board_link_gatt_post_event(
@@ -356,43 +461,155 @@ static bool playback_board_link_gatt_post_event(
     return false;
 }
 
-static void playback_board_link_gatt_gap_callback(TKL_BLE_GAP_PARAMS_EVT_T *event)
+static void playback_board_link_gatt_adv_command_failed(
+    playback_board_link_gatt_state_t *state,
+    ble_cmd_t command,
+    ble_err_t status
+)
+{
+    if (command == BLE_CREATE_ADV)
+    {
+        state->advertising_created = false;
+    }
+    playback_board_link_gatt_set_advertising(state, false);
+    playback_board_link_gatt_set_adv_stage(state, PLAYBACK_BOARD_LINK_ADV_IDLE);
+    PR_WARN(
+        "Board Link advertising command failed: command=%d status=%d",
+        (int)command,
+        (int)status
+    );
+}
+
+static void playback_board_link_gatt_adv_command_callback(
+    ble_cmd_t command,
+    ble_cmd_param_t *parameter
+)
 {
     playback_board_link_gatt_state_t *state = playback_board_link_active_state;
-    playback_board_link_gatt_event_t queued;
+    ble_err_t result;
 
-    if ((state == NULL) || (event == NULL))
+    if ((state == NULL) || state->closing || (parameter == NULL) ||
+        (parameter->cmd_idx != PLAYBACK_BOARD_LINK_GATT_ADV_INSTANCE))
     {
         return;
     }
-    memset(&queued, 0, sizeof(queued));
-    queued.connection_handle = event->conn_handle;
-
-    switch (event->type)
+    if (parameter->status != BK_OK)
     {
-        case TKL_BLE_EVT_STACK_INIT:
-            if (event->result == OPRT_OK)
+        playback_board_link_gatt_adv_command_failed(
+            state,
+            command,
+            parameter->status
+        );
+        return;
+    }
+
+    switch (command)
+    {
+        case BLE_CREATE_ADV:
+            if (playback_board_link_gatt_get_adv_stage(state) !=
+                PLAYBACK_BOARD_LINK_ADV_SETTING_PARAMS)
             {
-                queued.kind = PLAYBACK_BOARD_LINK_GATT_EVENT_STACK_READY;
-                (void)playback_board_link_gatt_post_event(state, &queued);
+                break;
+            }
+            state->advertising_created = true;
+            playback_board_link_gatt_set_adv_stage(
+                state,
+                PLAYBACK_BOARD_LINK_ADV_SETTING_DATA
+            );
+            result = bk_ble_set_adv_data(
+                PLAYBACK_BOARD_LINK_GATT_ADV_INSTANCE,
+                (uint8_t *)playback_board_link_adv_data,
+                (uint8_t)sizeof(playback_board_link_adv_data),
+                playback_board_link_gatt_adv_command_callback
+            );
+            if (result != BK_OK)
+            {
+                playback_board_link_gatt_adv_command_failed(
+                    state,
+                    BLE_SET_ADV_DATA,
+                    result
+                );
             }
             break;
 
-        case TKL_BLE_GAP_EVT_CONNECT:
-            if ((event->result == OPRT_OK) &&
-                (event->gap_event.connect.role == TKL_BLE_ROLE_SERVER))
+        case BLE_SET_ADV_DATA:
+            if (playback_board_link_gatt_get_adv_stage(state) !=
+                PLAYBACK_BOARD_LINK_ADV_SETTING_DATA)
             {
-                queued.kind = PLAYBACK_BOARD_LINK_GATT_EVENT_CONNECTED;
-                (void)playback_board_link_gatt_post_event(state, &queued);
+                break;
+            }
+            playback_board_link_gatt_set_adv_stage(
+                state,
+                PLAYBACK_BOARD_LINK_ADV_SETTING_SCAN_RESPONSE
+            );
+            result = bk_ble_set_scan_rsp_data(
+                PLAYBACK_BOARD_LINK_GATT_ADV_INSTANCE,
+                (uint8_t *)playback_board_link_scan_response,
+                (uint8_t)sizeof(playback_board_link_scan_response),
+                playback_board_link_gatt_adv_command_callback
+            );
+            if (result != BK_OK)
+            {
+                playback_board_link_gatt_adv_command_failed(
+                    state,
+                    BLE_SET_RSP_DATA,
+                    result
+                );
             }
             break;
 
-        case TKL_BLE_GAP_EVT_DISCONNECT:
-            if (event->gap_event.disconnect.role == TKL_BLE_ROLE_SERVER)
+        case BLE_SET_RSP_DATA:
+            if (playback_board_link_gatt_get_adv_stage(state) !=
+                PLAYBACK_BOARD_LINK_ADV_SETTING_SCAN_RESPONSE)
             {
-                queued.kind = PLAYBACK_BOARD_LINK_GATT_EVENT_DISCONNECTED;
-                (void)playback_board_link_gatt_post_event(state, &queued);
+                break;
             }
+            playback_board_link_gatt_set_adv_stage(
+                state,
+                PLAYBACK_BOARD_LINK_ADV_STARTING
+            );
+            result = bk_ble_start_advertising(
+                PLAYBACK_BOARD_LINK_GATT_ADV_INSTANCE,
+                0U,
+                playback_board_link_gatt_adv_command_callback
+            );
+            if (result != BK_OK)
+            {
+                playback_board_link_gatt_adv_command_failed(
+                    state,
+                    BLE_START_ADV,
+                    result
+                );
+            }
+            break;
+
+        case BLE_START_ADV:
+            if (playback_board_link_gatt_get_adv_stage(state) ==
+                PLAYBACK_BOARD_LINK_ADV_STARTING)
+            {
+                playback_board_link_gatt_set_adv_stage(
+                    state,
+                    PLAYBACK_BOARD_LINK_ADV_ACTIVE
+                );
+                playback_board_link_gatt_set_advertising(state, true);
+            }
+            break;
+
+        case BLE_STOP_ADV:
+            playback_board_link_gatt_set_advertising(state, false);
+            playback_board_link_gatt_set_adv_stage(
+                state,
+                PLAYBACK_BOARD_LINK_ADV_IDLE
+            );
+            break;
+
+        case BLE_DELETE_ADV:
+            state->advertising_created = false;
+            playback_board_link_gatt_set_advertising(state, false);
+            playback_board_link_gatt_set_adv_stage(
+                state,
+                PLAYBACK_BOARD_LINK_ADV_IDLE
+            );
             break;
 
         default:
@@ -400,51 +617,152 @@ static void playback_board_link_gatt_gap_callback(TKL_BLE_GAP_PARAMS_EVT_T *even
     }
 }
 
-static void playback_board_link_gatt_gatt_callback(TKL_BLE_GATT_PARAMS_EVT_T *event)
+static int32_t playback_board_link_gatt_gatts_callback(
+    bk_gatts_cb_event_t event,
+    bk_gatt_if_t gatts_if,
+    bk_ble_gatts_cb_param_t *parameter
+)
 {
     playback_board_link_gatt_state_t *state = playback_board_link_active_state;
     playback_board_link_gatt_event_t queued;
-    const TKL_BLE_DATA_REPORT_T *write_report;
+    ble_err_t result;
 
-    if ((state == NULL) || (event == NULL))
+    (void)gatts_if;
+    if ((state == NULL) || state->closing || (parameter == NULL))
     {
-        return;
+        return 0;
     }
     memset(&queued, 0, sizeof(queued));
-    queued.connection_handle = event->conn_handle;
 
-    switch (event->type)
+    switch (event)
     {
-        case TKL_BLE_GATT_EVT_MTU_REQUEST:
-            queued.kind = PLAYBACK_BOARD_LINK_GATT_EVENT_MTU_REQUEST;
-            queued.value = event->gatt_event.exchange_mtu;
-            (void)playback_board_link_gatt_post_event(state, &queued);
-            break;
-
-        case TKL_BLE_GATT_EVT_WRITE_REQ:
-            write_report = &event->gatt_event.write_report;
-            if ((write_report->char_handle !=
-                 state->characteristics[PLAYBACK_BOARD_LINK_GATT_COMMAND_CHAR_INDEX].handle) ||
-                (write_report->report.p_data == NULL) || (write_report->report.length == 0U) ||
-                (write_report->report.length > PLAYBACK_BOARD_LINK_GATT_ATT_VALUE_MAX))
+        case BK_GATTS_REG_EVT:
+            if (parameter->reg.status != BK_GATT_OK)
             {
+                tal_mutex_lock(state->status_mutex);
+                state->starting = false;
+                state->status.started = false;
+                tal_mutex_unlock(state->status_mutex);
                 break;
             }
+            state->gatts_if = parameter->reg.gatt_if;
+            state->app_registered = true;
+            result = bk_ble_gatts_create_attr_tab(
+                state->attributes,
+                state->gatts_if,
+                PLAYBACK_BOARD_LINK_GATT_ATTR_COUNT,
+                PLAYBACK_BOARD_LINK_GATT_MAX_ATTRIBUTE_COUNT
+            );
+            if (result != BK_OK)
+            {
+                tal_mutex_lock(state->status_mutex);
+                state->starting = false;
+                state->status.started = false;
+                tal_mutex_unlock(state->status_mutex);
+            }
+            break;
 
-            queued.kind = PLAYBACK_BOARD_LINK_GATT_EVENT_COMMAND_FRAGMENT;
-            queued.characteristic_handle = write_report->char_handle;
-            queued.length = write_report->report.length;
-            memcpy(queued.data, write_report->report.p_data, queued.length);
+        case BK_GATTS_CREAT_ATTR_TAB_EVT:
+            if ((parameter->add_attr_tab.status != BK_GATT_OK) ||
+                (parameter->add_attr_tab.num_handle !=
+                 PLAYBACK_BOARD_LINK_GATT_ATTR_COUNT) ||
+                (parameter->add_attr_tab.handles == NULL))
+            {
+                tal_mutex_lock(state->status_mutex);
+                state->starting = false;
+                state->status.started = false;
+                tal_mutex_unlock(state->status_mutex);
+                break;
+            }
+            memcpy(
+                state->attribute_handles,
+                parameter->add_attr_tab.handles,
+                sizeof(state->attribute_handles)
+            );
+            state->attribute_table_created = true;
+            result = bk_ble_gatts_start_service(
+                state->attribute_handles[PLAYBACK_BOARD_LINK_GATT_ATTR_SERVICE]
+            );
+            if (result != BK_OK)
+            {
+                tal_mutex_lock(state->status_mutex);
+                state->starting = false;
+                state->status.started = false;
+                tal_mutex_unlock(state->status_mutex);
+            }
+            break;
+
+        case BK_GATTS_START_EVT:
+            if ((parameter->start.status != BK_GATT_OK) ||
+                (parameter->start.service_handle !=
+                 state->attribute_handles[PLAYBACK_BOARD_LINK_GATT_ATTR_SERVICE]))
+            {
+                tal_mutex_lock(state->status_mutex);
+                state->starting = false;
+                state->status.started = false;
+                tal_mutex_unlock(state->status_mutex);
+                break;
+            }
+            state->service_registered = true;
+            PR_NOTICE("Board Link native dual-mode GATT service started");
+            tal_mutex_lock(state->status_mutex);
+            state->starting = false;
+            state->status.started = true;
+            tal_mutex_unlock(state->status_mutex);
+            queued.kind = PLAYBACK_BOARD_LINK_GATT_EVENT_STACK_READY;
             (void)playback_board_link_gatt_post_event(state, &queued);
             break;
 
-        case TKL_BLE_GATT_EVT_SUBSCRIBE:
-            if (event->gatt_event.subscribe.char_handle ==
-                state->characteristics[PLAYBACK_BOARD_LINK_GATT_REPORT_CHAR_INDEX].handle)
+        case BK_GATTS_CONNECT_EVT:
+            queued.kind = PLAYBACK_BOARD_LINK_GATT_EVENT_CONNECTED;
+            queued.connection_handle = parameter->connect.conn_id;
+            (void)playback_board_link_gatt_post_event(state, &queued);
+            break;
+
+        case BK_GATTS_DISCONNECT_EVT:
+            queued.kind = PLAYBACK_BOARD_LINK_GATT_EVENT_DISCONNECTED;
+            queued.connection_handle = parameter->disconnect.conn_id;
+            (void)playback_board_link_gatt_post_event(state, &queued);
+            break;
+
+        case BK_GATTS_MTU_EVT:
+            queued.kind = PLAYBACK_BOARD_LINK_GATT_EVENT_MTU_REQUEST;
+            queued.connection_handle = parameter->mtu.conn_id;
+            queued.value = parameter->mtu.mtu;
+            (void)playback_board_link_gatt_post_event(state, &queued);
+            break;
+
+        case BK_GATTS_WRITE_EVT:
+            queued.connection_handle = parameter->write.conn_id;
+            queued.characteristic_handle = parameter->write.handle;
+            if ((parameter->write.handle ==
+                 state->attribute_handles[PLAYBACK_BOARD_LINK_GATT_ATTR_COMMAND]) &&
+                (parameter->write.value != NULL) &&
+                (parameter->write.len > 0U) &&
+                (parameter->write.len <= PLAYBACK_BOARD_LINK_GATT_ATT_VALUE_MAX) &&
+                !parameter->write.is_prep && (parameter->write.offset == 0U))
             {
+                queued.kind = PLAYBACK_BOARD_LINK_GATT_EVENT_COMMAND_FRAGMENT;
+                queued.length = parameter->write.len;
+                memcpy(queued.data, parameter->write.value, queued.length);
+                (void)playback_board_link_gatt_post_event(state, &queued);
+            }
+            else if ((parameter->write.handle ==
+                      state->attribute_handles[PLAYBACK_BOARD_LINK_GATT_ATTR_REPORT_CCCD]) &&
+                     (parameter->write.value != NULL) &&
+                     (parameter->write.len >= sizeof(uint16_t)) &&
+                     !parameter->write.is_prep && (parameter->write.offset == 0U))
+            {
+                uint16_t client_configuration = 0U;
+
+                memcpy(
+                    &client_configuration,
+                    parameter->write.value,
+                    sizeof(client_configuration)
+                );
+                state->report_cccd = client_configuration;
                 queued.kind = PLAYBACK_BOARD_LINK_GATT_EVENT_SUBSCRIPTION;
-                queued.characteristic_handle = event->gatt_event.subscribe.char_handle;
-                queued.enabled = event->gatt_event.subscribe.cur_notify != 0U;
+                queued.enabled = (client_configuration & 0x0001U) != 0U;
                 (void)playback_board_link_gatt_post_event(state, &queued);
             }
             break;
@@ -452,6 +770,7 @@ static void playback_board_link_gatt_gatt_callback(TKL_BLE_GATT_PARAMS_EVT_T *ev
         default:
             break;
     }
+    return 0;
 }
 
 static playback_board_link_gatt_result_t playback_board_link_gatt_send_report_state(
@@ -468,7 +787,7 @@ static playback_board_link_gatt_result_t playback_board_link_gatt_send_report_st
     uint16_t fragment_index;
     size_t fragment_length;
     uint32_t message_id;
-    OPERATE_RET notify_result;
+    ble_err_t notify_result;
 
     if ((state == NULL) || (report == NULL))
     {
@@ -543,13 +862,15 @@ static playback_board_link_gatt_result_t playback_board_link_gatt_send_report_st
             return PLAYBACK_BOARD_LINK_GATT_FRAGMENT_FAILED;
         }
 
-        notify_result = tkl_ble_gatts_value_notify(
+        notify_result = bk_ble_gatts_send_indicate(
+            state->gatts_if,
             status.connection_handle,
-            state->characteristics[PLAYBACK_BOARD_LINK_GATT_REPORT_CHAR_INDEX].handle,
+            state->attribute_handles[PLAYBACK_BOARD_LINK_GATT_ATTR_REPORT],
+            (uint16_t)fragment_length,
             state->report_fragment,
-            (uint16_t)fragment_length
+            false
         );
-        if (notify_result != OPRT_OK)
+        if (notify_result != BK_OK)
         {
             tal_mutex_unlock(state->send_mutex);
             return PLAYBACK_BOARD_LINK_GATT_NOTIFY_FAILED;
@@ -718,6 +1039,7 @@ static void playback_board_link_gatt_process_connected(
 )
 {
     playback_board_link_reassembler_reset(&state->reassembler);
+    playback_board_link_gatt_set_adv_stage(state, PLAYBACK_BOARD_LINK_ADV_IDLE);
 
     tal_mutex_lock(state->status_mutex);
     state->status.advertising = false;
@@ -738,6 +1060,7 @@ static void playback_board_link_gatt_process_disconnected(
 )
 {
     playback_board_link_reassembler_reset(&state->reassembler);
+    playback_board_link_gatt_set_adv_stage(state, PLAYBACK_BOARD_LINK_ADV_IDLE);
 
     tal_mutex_lock(state->status_mutex);
     state->status.advertising = false;
@@ -796,11 +1119,6 @@ static void playback_board_link_gatt_process_mtu(
     {
         mtu = PLAYBACK_BOARD_LINK_GATT_ATT_MTU_MAX;
     }
-    if (tkl_ble_gatts_exchange_mtu_reply(event->connection_handle, mtu) != OPRT_OK)
-    {
-        return;
-    }
-
     tal_mutex_lock(state->status_mutex);
     if (state->status.connected && (state->status.connection_handle == event->connection_handle))
     {
@@ -991,31 +1309,16 @@ playback_board_link_gatt_result_t playback_board_link_gatt_start(
     state->starting = true;
     tal_mutex_unlock(state->status_mutex);
 
-    if ((tkl_ble_gap_callback_register(playback_board_link_gatt_gap_callback) != OPRT_OK) ||
-        (tkl_ble_gatt_callback_register(playback_board_link_gatt_gatt_callback) != OPRT_OK) ||
-        (tkl_ble_gatts_service_add(&state->gatts) != OPRT_OK))
+    if ((bk_ble_gatts_register_callback(playback_board_link_gatt_gatts_callback) !=
+         BK_OK) ||
+        (bk_ble_gatts_app_register(PLAYBACK_BOARD_LINK_GATT_APP_ID) != BK_OK))
     {
         tal_mutex_lock(state->status_mutex);
         state->starting = false;
+        state->status.started = false;
         tal_mutex_unlock(state->status_mutex);
         return PLAYBACK_BOARD_LINK_GATT_PLATFORM_ERROR;
     }
-    state->service_registered = true;
-
-    if (tkl_ble_stack_init(TKL_BLE_ROLE_SERVER) != OPRT_OK)
-    {
-        (void)tkl_ble_stack_deinit(TKL_BLE_ROLE_SERVER);
-        state->service_registered = false;
-        tal_mutex_lock(state->status_mutex);
-        state->starting = false;
-        tal_mutex_unlock(state->status_mutex);
-        return PLAYBACK_BOARD_LINK_GATT_PLATFORM_ERROR;
-    }
-    state->stack_initialized = true;
-    tal_mutex_lock(state->status_mutex);
-    state->starting = false;
-    state->status.started = true;
-    tal_mutex_unlock(state->status_mutex);
     return PLAYBACK_BOARD_LINK_GATT_OK;
 }
 
@@ -1062,15 +1365,30 @@ void playback_board_link_gatt_close(playback_board_link_gatt_t *gatt)
     state->closing = true;
 
     playback_board_link_gatt_status_snapshot(state, &status);
-    if (status.advertising)
+    if (status.advertising ||
+        (playback_board_link_gatt_get_adv_stage(state) != PLAYBACK_BOARD_LINK_ADV_IDLE))
     {
-        (void)tkl_ble_gap_adv_stop();
+        playback_board_link_gatt_set_adv_stage(
+            state,
+            PLAYBACK_BOARD_LINK_ADV_STOPPING
+        );
+        (void)bk_ble_stop_advertising(
+            PLAYBACK_BOARD_LINK_GATT_ADV_INSTANCE,
+            NULL
+        );
     }
-    if (state->stack_initialized || state->service_registered)
+    if (state->service_registered)
     {
-        (void)tkl_ble_stack_deinit(TKL_BLE_ROLE_SERVER);
-        state->stack_initialized = false;
+        (void)bk_ble_gatts_stop_service(
+            state->attribute_handles[PLAYBACK_BOARD_LINK_GATT_ATTR_SERVICE]
+        );
         state->service_registered = false;
+    }
+    if (state->app_registered &&
+        (state->gatts_if != PLAYBACK_BOARD_LINK_GATT_INVALID_INTERFACE))
+    {
+        (void)bk_ble_gatts_app_unregister(state->gatts_if);
+        state->app_registered = false;
     }
     playback_board_link_active_state = NULL;
 
