@@ -31,6 +31,10 @@
 #define DEMO_HTTP_TLS_NO_VERIFY (0)
 #endif
 
+#ifndef DEMO_PLAYBACK_AUTHORIZATION
+#define DEMO_PLAYBACK_AUTHORIZATION NULL
+#endif
+
 typedef struct
 {
     playback_board_link_gatt_t gatt;
@@ -41,6 +45,7 @@ typedef struct
 static playback_app_state_t playback_app_state;
 static const uint8_t playback_app_speaker_address[PLAYBACK_SPEAKER_LINK_ADDRESS_BYTES] =
     DEMO_SPEAKER_ADDRESS;
+static const char *const playback_app_authorization = DEMO_PLAYBACK_AUTHORIZATION;
 
 #if defined(TUYA_T5AI_BOARD_LCD_35565) && (TUYA_T5AI_BOARD_LCD_35565 == 1)
 static const uint8_t playback_ili9488_init_sequence[] = {
@@ -270,6 +275,7 @@ OPERATE_RET playback_app_start(void)
     memset(&engine_config, 0, sizeof(engine_config));
     strncpy(engine_config.boot_id, gatt_status.boot_id, sizeof(engine_config.boot_id) - 1U);
     engine_config.scheduler.http.timeout_ms = PLAYBACK_HTTP_DEFAULT_TIMEOUT_MS;
+    engine_config.scheduler.http.authorization = playback_app_authorization;
     engine_config.scheduler.http.tls_no_verify = DEMO_HTTP_TLS_NO_VERIFY != 0;
     memcpy(
         engine_config.scheduler.speaker_address,
@@ -310,6 +316,24 @@ OPERATE_RET playback_app_start(void)
     {
         PR_WARN("Fixed speaker address is not configured; define DEMO_SPEAKER_ADDRESS in demo_network_config.h");
     }
+    else
+    {
+        PR_NOTICE(
+            "Playback speaker target: %02X:%02X:%02X:%02X:%02X:%02X",
+            playback_app_speaker_address[5],
+            playback_app_speaker_address[4],
+            playback_app_speaker_address[3],
+            playback_app_speaker_address[2],
+            playback_app_speaker_address[1],
+            playback_app_speaker_address[0]
+        );
+    }
+    PR_NOTICE(
+        "Playback media authorization: %s",
+        ((playback_app_authorization != NULL) && (playback_app_authorization[0] != '\0'))
+            ? "configured"
+            : "not configured"
+    );
     PR_NOTICE("Playback application ready; media starts only from Board Link LOAD_SESSION");
     return OPRT_OK;
 }

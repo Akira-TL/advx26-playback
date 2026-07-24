@@ -14,7 +14,7 @@
 #include "tal_api.h"
 
 #define PLAYBACK_HTTP_RETRY_COUNT (3U)
-#define PLAYBACK_HTTP_HEADER_COUNT_MAX (3U)
+#define PLAYBACK_HTTP_HEADER_COUNT_MAX (4U)
 
 typedef struct
 {
@@ -392,7 +392,9 @@ playback_http_result_t playback_http_range_probe(
 )
 {
     http_client_response_t response;
+    http_client_header_t headers[1U];
     playback_http_result_t result;
+    uint8_t header_count = 0U;
     char content_length_text[24U];
     char accept_ranges[32U];
     char etag[PLAYBACK_ETAG_MAX_LEN + 1U];
@@ -407,7 +409,20 @@ playback_http_result_t playback_http_range_probe(
         return PLAYBACK_HTTP_CANCELLED;
     }
 
-    result = playback_http_request_with_retry(reader, HTTP_METHOD_HEAD, NULL, 0U, &response);
+    if ((reader->config.authorization != NULL) && (reader->config.authorization[0] != '\0'))
+    {
+        headers[header_count].key = "Authorization";
+        headers[header_count].value = reader->config.authorization;
+        ++header_count;
+    }
+
+    result = playback_http_request_with_retry(
+        reader,
+        HTTP_METHOD_HEAD,
+        (header_count > 0U) ? headers : NULL,
+        header_count,
+        &response
+    );
     if (result != PLAYBACK_HTTP_OK)
     {
         return result;
@@ -461,6 +476,7 @@ playback_http_result_t playback_http_range_read_at(
     char content_range_value[80U];
     char etag[PLAYBACK_ETAG_MAX_LEN + 1U];
     uint64_t requested_end;
+    uint8_t header_count = 0U;
 
     if ((reader == NULL) || (destination == NULL) || (length == 0U) || (length > destination_capacity) ||
         (length > PLAYBACK_HTTP_RANGE_MAX_LENGTH))
@@ -475,15 +491,29 @@ playback_http_result_t playback_http_range_read_at(
     }
 
     snprintf(range_value, sizeof(range_value), "bytes=%lu-%lu", (unsigned long)offset, (unsigned long)requested_end);
-    headers[0].key = "Range";
-    headers[0].value = range_value;
-    headers[1].key = "If-Range";
-    headers[1].value = reader->asset.etag;
-    headers[2].key = "Accept-Encoding";
-    headers[2].value = "identity";
+    headers[header_count].key = "Range";
+    headers[header_count].value = range_value;
+    ++header_count;
+    headers[header_count].key = "If-Range";
+    headers[header_count].value = reader->asset.etag;
+    ++header_count;
+    headers[header_count].key = "Accept-Encoding";
+    headers[header_count].value = "identity";
+    ++header_count;
+    if ((reader->config.authorization != NULL) && (reader->config.authorization[0] != '\0'))
+    {
+        headers[header_count].key = "Authorization";
+        headers[header_count].value = reader->config.authorization;
+        ++header_count;
+    }
 
-    result = playback_http_request_with_retry(reader, HTTP_METHOD_GET, headers, PLAYBACK_HTTP_HEADER_COUNT_MAX,
-                                              &response);
+    result = playback_http_request_with_retry(
+        reader,
+        HTTP_METHOD_GET,
+        headers,
+        header_count,
+        &response
+    );
     if (result != PLAYBACK_HTTP_OK)
     {
         return result;
