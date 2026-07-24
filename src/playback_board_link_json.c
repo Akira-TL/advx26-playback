@@ -621,9 +621,11 @@ playback_board_link_json_result_t playback_board_link_command_parse(
     {
         goto cleanup;
     }
-    if (schema != PLAYBACK_PROTOCOL_SCHEMA_VERSION)
+    command->schema_version = schema;
+
+    if (!playback_board_link_json_parse_nullable_session_id(root, command->session_id) ||
+        !playback_board_link_json_get_u32(root, "sequence_id", 0U, UINT32_MAX, &command->sequence_id))
     {
-        result = PLAYBACK_BOARD_LINK_JSON_PROTOCOL_INCOMPATIBLE;
         goto cleanup;
     }
     if (!cJSON_IsString(type) || (type->valuestring == NULL))
@@ -635,14 +637,15 @@ playback_board_link_json_result_t playback_board_link_command_parse(
         result = PLAYBACK_BOARD_LINK_JSON_UNKNOWN_TYPE;
         goto cleanup;
     }
-    if (!playback_board_link_json_parse_nullable_session_id(root, command->session_id) ||
-        !playback_board_link_json_get_u32(root, "sequence_id", 0U, UINT32_MAX, &command->sequence_id) ||
-        !cJSON_IsObject(payload))
+    if (schema != PLAYBACK_PROTOCOL_SCHEMA_VERSION)
+    {
+        result = PLAYBACK_BOARD_LINK_JSON_PROTOCOL_INCOMPATIBLE;
+        goto cleanup;
+    }
+    if (!cJSON_IsObject(payload))
     {
         goto cleanup;
     }
-
-    command->schema_version = schema;
     switch (command->kind)
     {
         case PLAYBACK_COMMAND_HELLO:
@@ -704,7 +707,7 @@ playback_board_link_json_result_t playback_board_link_command_parse(
 cleanup:
     if (result != PLAYBACK_BOARD_LINK_JSON_OK)
     {
-        memset(command, 0, sizeof(*command));
+        memset(&command->payload, 0, sizeof(command->payload));
     }
     cJSON_Delete(root);
     tal_free(json);

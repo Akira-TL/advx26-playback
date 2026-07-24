@@ -24,6 +24,14 @@ typedef enum
     PLAYBACK_BOARD_LINK_JSON_NO_MEMORY,
 } playback_board_link_json_result_t;
 
+/**
+ * @brief Parse one complete Board Link command body.
+ *
+ * On success, the full command is valid. On failure, any successfully parsed
+ * top-level correlation fields (`schema_version`, `session_id`, and
+ * `sequence_id`) are retained while the payload union is cleared. Callers must
+ * not execute or inspect the payload unless the result is `OK`.
+ */
 playback_board_link_json_result_t playback_board_link_command_parse(
     const uint8_t *body,
     size_t body_length,
