@@ -36,6 +36,7 @@ typedef struct
     size_t ca_cert_length;
     const char *authorization;
     bool tls_no_verify;
+    bool discover_metadata;
     uint32_t timeout_ms;
 } playback_http_config_t;
 

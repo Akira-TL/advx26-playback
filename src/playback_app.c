@@ -10,15 +10,23 @@
 
 #include "board_com_api.h"
 #include "demo_network_config.h"
+#include "http_session.h"
 #include "lv_vendor.h"
 #include "lvgl.h"
 #include "mob_screen.h"
 #include "playback_bluetooth_browser.h"
 #include "playback_board_link_gatt.h"
 #include "playback_engine.h"
+#include "playback_h264_decoder.h"
+#include "playback_http_range.h"
+#include "playback_mp4_demux.h"
 #include "playback_network.h"
+#include "playback_video_output.h"
+#include "playback_video_test.h"
 #include "tal_api.h"
 #include "tkl_output.h"
+#include "tkl_speaker.h"
+#include <modules/mp3dec.h>
 
 #if defined(TUYA_T5AI_BOARD_LCD_35565) && (TUYA_T5AI_BOARD_LCD_35565 == 1)
 #include "tdd_disp_ili9488.h"
@@ -42,6 +50,10 @@ typedef struct
     playback_engine_t engine;
     playback_bluetooth_browser_t bluetooth_browser;
     playback_speaker_link_t speaker_probe;
+    THREAD_HANDLE speaker_test_thread;
+    THREAD_HANDLE video_test_thread;
+    bool speaker_test_running;
+    bool video_test_running;
     bool started;
 } playback_app_state_t;
 
@@ -445,6 +457,400 @@ static void playback_app_log_information(void)
     PR_NOTICE("Platform commit-id:  %s", PLATFORM_COMMIT);
 }
 
+#define PLAYBACK_MP3_CHUNK_BYTES     (8U * 1024U)
+#define PLAYBACK_MP3_ACCUM_EXTRA     (16384U)
+
+static void *playback_mp3_psram_alloc(size_t size)
+{
+    return tal_psram_malloc((uint32_t)size);
+}
+
+static void playback_mp3_psram_free(void *buff)
+{
+    if (buff != NULL) {
+        tal_psram_free(buff);
+    }
+}
+
+static void *playback_mp3_psram_memset(void *s, unsigned char c, size_t n)
+{
+    return memset(s, (int)c, n);
+}
+
+static void playback_app_speaker_test_run(void)
+{
+    static const char *const audio_url =
+        "http://advx26.babelbeast.com/debug/audio.mp3";
+    http_session_t session = NULL;
+    http_req_t request;
+    http_resp_t *response = NULL;
+    http_custom_header_t request_headers[1U];
+    OPERATE_RET operation_result;
+    uint8_t *accum_buf = NULL;
+    uint8_t *http_buf = NULL;
+    short *pcm_buf = NULL;
+    HMP3Decoder decoder = NULL;
+    MP3FrameInfo frame_info;
+    unsigned char *read_ptr;
+    int accum_len;
+    int read_size;
+    uint32_t remaining;
+    uint32_t frame_count = 0U;
+    bool speaker_started = false;
+    bool stream_complete = false;
+
+    PR_NOTICE("MP3: URL = %s", audio_url);
+    PR_NOTICE("MP3: opening persistent HTTP session...");
+    operation_result = http_open_session(&session, audio_url, 30000U);
+    if (operation_result != OPRT_OK)
+    {
+        PR_ERR("MP3: HTTP session open failed: %d", operation_result);
+        return;
+    }
+
+    memset(&request, 0, sizeof(request));
+    request_headers[0U].key = "Accept-Encoding";
+    request_headers[0U].value = "identity";
+    request.type = HTTP_GET;
+    request.version = HTTP_VER_1_1;
+    request.custom_headers = request_headers;
+    request.custom_headers_count = 1;
+    operation_result = http_send_request(
+        session,
+        &request,
+        HTTP_REQUEST_KEEP_ALIVE_FLAG
+    );
+    if (operation_result != OPRT_OK)
+    {
+        PR_ERR("MP3: HTTP GET failed: %d", operation_result);
+        goto cleanup;
+    }
+
+    operation_result = http_get_response_hdr(session, &response);
+    if ((operation_result != OPRT_OK) ||
+        (response == NULL) ||
+        (response->status_code != 200) ||
+        (response->content_length == 0U))
+    {
+        PR_ERR(
+            "MP3: invalid HTTP response: result=%d status=%d length=%u",
+            operation_result,
+            (response != NULL) ? response->status_code : 0,
+            (response != NULL) ? response->content_length : 0U
+        );
+        goto cleanup;
+    }
+
+    remaining = response->content_length;
+    PR_NOTICE(
+        "MP3: persistent stream length=%u read_chunk=%u",
+        response->content_length,
+        (unsigned int)PLAYBACK_MP3_CHUNK_BYTES
+    );
+
+    /* Allocate streaming buffers after the HTTP metadata probe. */
+    accum_buf = tal_psram_malloc(PLAYBACK_MP3_CHUNK_BYTES + PLAYBACK_MP3_ACCUM_EXTRA);
+    http_buf  = tal_psram_malloc(PLAYBACK_MP3_CHUNK_BYTES);
+    pcm_buf   = tal_psram_malloc(
+        (uint32_t)(MAX_NSAMP * MAX_NCHAN * MAX_NGRAN) * sizeof(short));
+    if ((accum_buf == NULL) || (http_buf == NULL) || (pcm_buf == NULL)) {
+        PR_ERR("MP3: buffer alloc failed");
+        goto cleanup;
+    }
+
+    MP3SetBuffMethod(playback_mp3_psram_alloc,
+                     playback_mp3_psram_free,
+                     playback_mp3_psram_memset);
+    decoder = MP3InitDecoder();
+    if (decoder == NULL) {
+        PR_ERR("MP3: decoder init failed");
+        goto cleanup;
+    }
+
+    /* Stream: download, decode, downmix to mono, then play. */
+    accum_len = 0;
+
+    while (remaining > 0U) {
+        const uint32_t requested =
+            (remaining < PLAYBACK_MP3_CHUNK_BYTES)
+                ? remaining
+                : PLAYBACK_MP3_CHUNK_BYTES;
+        uint32_t chunk;
+        int decode_ret;
+
+        read_size = http_read_content(session, http_buf, requested);
+        if (read_size < 0)
+        {
+            PR_ERR(
+                "MP3: persistent HTTP read failed after %u bytes",
+                response->content_length - remaining
+            );
+            break;
+        }
+        if (read_size == 0)
+        {
+            PR_WARN(
+                "MP3: premature HTTP EOF after %u/%u bytes",
+                response->content_length - remaining,
+                response->content_length
+            );
+            break;
+        }
+        chunk = (uint32_t)read_size;
+
+        /* append to accumulator (only if there's room — shift if needed) */
+        if ((uint32_t)accum_len + chunk >
+            PLAYBACK_MP3_CHUNK_BYTES + PLAYBACK_MP3_ACCUM_EXTRA) {
+            PR_ERR("MP3: accum overflow");
+            break;
+        }
+        memcpy(accum_buf + accum_len, http_buf, chunk);
+        accum_len += (int)chunk;
+        remaining -= chunk;
+
+        /* decode all complete frames in accumulator */
+        read_ptr = accum_buf;
+        while (accum_len > 0) {
+            int sync_off = MP3FindSyncWord(read_ptr, accum_len);
+            unsigned char *frame_start;
+            int frame_length;
+
+            if (sync_off < 0)
+            {
+                if (accum_len > 1)
+                {
+                    read_ptr += accum_len - 1;
+                    accum_len = 1;
+                }
+                break;
+            }
+            read_ptr += sync_off;
+            accum_len -= sync_off;
+            frame_start = read_ptr;
+            frame_length = accum_len;
+
+            decode_ret = MP3Decode(decoder, &read_ptr, &accum_len, pcm_buf, 0);
+            if (decode_ret == ERR_MP3_INDATA_UNDERFLOW)
+            {
+                read_ptr = frame_start;
+                accum_len = frame_length;
+                break;
+            }
+            if (decode_ret != ERR_MP3_NONE)
+            {
+                if ((read_ptr <= frame_start) || (accum_len >= frame_length))
+                {
+                    read_ptr = frame_start + 1;
+                    accum_len = frame_length - 1;
+                }
+                continue;
+            }
+
+            MP3GetLastFrameInfo(decoder, &frame_info);
+            if (frame_info.outputSamps <= 0) {
+                continue;
+            }
+
+            frame_count++;
+            {
+                uint32_t sample_count = (uint32_t)frame_info.outputSamps;
+                uint32_t pcm_bytes;
+                short *pw = pcm_buf;
+
+                if (frame_info.nChans == 2)
+                {
+                    uint32_t sample_index;
+                    sample_count /= 2U;
+                    for (sample_index = 0U; sample_index < sample_count; ++sample_index)
+                    {
+                        const int32_t mixed =
+                            (int32_t)pcm_buf[sample_index * 2U] +
+                            (int32_t)pcm_buf[(sample_index * 2U) + 1U];
+                        pcm_buf[sample_index] = (short)(mixed / 2);
+                    }
+                }
+                else if (frame_info.nChans != 1)
+                {
+                    PR_ERR("MP3: unsupported channel count %d", frame_info.nChans);
+                    goto cleanup;
+                }
+
+                if (!speaker_started)
+                {
+                    TKL_SPK_CFG_T speaker_config = {0};
+                    speaker_config.chl_num = 1;
+                    speaker_config.sample_rate = (uint32_t)frame_info.samprate;
+                    speaker_config.datebits = TKL_SPK_DATABITS_16;
+                    speaker_config.volume = 60;
+                    speaker_config.card = TKL_SPK_TYPE_BOARD;
+                    speaker_config.codectype = TKL_CODEC_SPK_PCM;
+                    speaker_config.spk_gpio = 28;
+                    speaker_config.spk_gpio_polarity = 0;
+                    if ((tkl_speaker_init(&speaker_config) != OPRT_OK) ||
+                        (tkl_speaker_start() != OPRT_OK))
+                    {
+                        PR_ERR(
+                            "MP3: speaker start failed at %d Hz",
+                            frame_info.samprate
+                        );
+                        goto cleanup;
+                    }
+                    speaker_started = true;
+                    PR_NOTICE(
+                        "MP3: speaker started at %d Hz mono",
+                        frame_info.samprate
+                    );
+                }
+
+                pcm_bytes = sample_count * sizeof(short);
+                while (pcm_bytes >= 640U)
+                {
+                    (void)tkl_speaker_write((uint8_t *)pw, 640U);
+                    pw += 320;
+                    pcm_bytes -= 640U;
+                }
+                if (pcm_bytes > 0U)
+                {
+                    (void)tkl_speaker_write((uint8_t *)pw, pcm_bytes);
+                }
+            }
+        }
+
+        /* shift leftover to front of accum_buf */
+        if (accum_len > 0 && read_ptr != accum_buf) {
+            memmove(accum_buf, read_ptr, (size_t)accum_len);
+        }
+    }
+
+    stream_complete = (remaining == 0U);
+    if (stream_complete)
+    {
+        PR_NOTICE("MP3: stream complete (%lu frames decoded)", frame_count);
+    }
+    else
+    {
+        PR_WARN(
+            "MP3: stream stopped with %u bytes remaining (%lu frames decoded)",
+            remaining,
+            frame_count
+        );
+    }
+
+cleanup:
+    if (response != NULL)
+    {
+        (void)http_free_response_hdr(&response);
+    }
+    if (session != NULL)
+    {
+        (void)http_close_session(&session);
+    }
+    if (speaker_started)
+    {
+        (void)tkl_speaker_stop();
+        (void)tkl_speaker_deinit();
+    }
+    if (pcm_buf   != NULL) { tal_psram_free(pcm_buf); }
+    if (decoder   != NULL) { MP3FreeDecoder(decoder); }
+    if (http_buf  != NULL) { tal_psram_free(http_buf); }
+    if (accum_buf != NULL) { tal_psram_free(accum_buf); }
+}
+
+static void playback_app_speaker_test_worker(void *context)
+{
+    playback_app_state_t *state = context;
+
+    playback_app_speaker_test_run();
+    if (state != NULL)
+    {
+        state->speaker_test_running = false;
+        state->speaker_test_thread = NULL;
+        PR_NOTICE("MP3: test worker finished; TEST is available");
+    }
+}
+
+static void playback_app_speaker_test(void *context)
+{
+    playback_app_state_t *state = context;
+    THREAD_CFG_T thread_config;
+
+    if ((state == NULL) || state->speaker_test_running || state->video_test_running)
+    {
+        PR_WARN("MP3: another media test is already running");
+        return;
+    }
+
+    memset(&thread_config, 0, sizeof(thread_config));
+    thread_config.stackDepth = 12U * 1024U;
+    thread_config.priority = THREAD_PRIO_2;
+    thread_config.thrdname = "speaker_test";
+    thread_config.psram_mode = 1U;
+    state->speaker_test_running = true;
+    if (tal_thread_create_and_start(
+            &state->speaker_test_thread,
+            NULL,
+            NULL,
+            playback_app_speaker_test_worker,
+            state,
+            &thread_config
+        ) != OPRT_OK)
+    {
+        state->speaker_test_running = false;
+        state->speaker_test_thread = NULL;
+        PR_ERR("MP3: unable to start test worker");
+    }
+}
+
+static void playback_app_video_test_worker(void *context)
+{
+    playback_app_state_t *state = context;
+    playback_video_test_result_t result = playback_video_test_run(
+        "http://advx26.babelbeast.com/debug/video.mp4",
+        mob_screen_present_rgb565,
+        NULL
+    );
+
+    PR_NOTICE("VIDEO: test finished: %s", playback_video_test_result_name(result));
+    if (state != NULL)
+    {
+        state->video_test_running = false;
+        state->video_test_thread = NULL;
+        PR_NOTICE("VIDEO: test worker finished; VIDEO is available");
+    }
+}
+
+static void playback_app_video_test(void *context)
+{
+    playback_app_state_t *state = context;
+    THREAD_CFG_T thread_config;
+
+    if ((state == NULL) || state->video_test_running || state->speaker_test_running)
+    {
+        PR_WARN("VIDEO: another media test is already running");
+        return;
+    }
+
+    memset(&thread_config, 0, sizeof(thread_config));
+    thread_config.stackDepth = 24U * 1024U;
+    thread_config.priority = THREAD_PRIO_2;
+    thread_config.thrdname = "video_test";
+    thread_config.psram_mode = 1U;
+    state->video_test_running = true;
+    if (tal_thread_create_and_start(
+            &state->video_test_thread,
+            NULL,
+            NULL,
+            playback_app_video_test_worker,
+            state,
+            &thread_config
+        ) != OPRT_OK)
+    {
+        state->video_test_running = false;
+        state->video_test_thread = NULL;
+        PR_ERR("VIDEO: unable to start test worker");
+    }
+}
+
 OPERATE_RET playback_app_start(void)
 {
     playback_board_link_gatt_config_t gatt_config;
@@ -478,6 +884,14 @@ OPERATE_RET playback_app_start(void)
     screen_bluetooth_callbacks.on_connect = playback_app_bluetooth_connect_callback;
     screen_bluetooth_callbacks.context = &playback_app_state;
     mob_screen_set_bluetooth_callbacks(&screen_bluetooth_callbacks);
+    mob_screen_set_speaker_test_callback(
+        playback_app_speaker_test,
+        &playback_app_state
+    );
+    mob_screen_set_video_test_callback(
+        playback_app_video_test,
+        &playback_app_state
+    );
     lv_vendor_init(DISPLAY_NAME);
     lv_vendor_disp_lock();
     mob_screen_create();

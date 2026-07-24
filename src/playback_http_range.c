@@ -1,6 +1,6 @@
 /**
  * @file playback_http_range.c
- * @brief Immutable HTTP HEAD and single-range reader for Playback media.
+ * @brief Immutable HTTP byte-range reader for Playback media.
  */
 
 #include "playback_http_range.h"
@@ -15,6 +15,7 @@
 
 #define PLAYBACK_HTTP_RETRY_COUNT (3U)
 #define PLAYBACK_HTTP_HEADER_COUNT_MAX (4U)
+#define PLAYBACK_HTTP_REQUEST_SLICE_LENGTH (8U * 1024U)
 
 typedef struct
 {
@@ -221,26 +222,6 @@ static bool playback_header_value(
     return false;
 }
 
-static bool playback_parse_u32(const char *text, uint32_t *value)
-{
-    char *end = NULL;
-    unsigned long parsed;
-
-    if ((text == NULL) || (value == NULL) || (text[0] == '\0'))
-    {
-        return false;
-    }
-
-    parsed = strtoul(text, &end, 10);
-    if ((end == text) || (*end != '\0') || (parsed > 0xFFFFFFFFUL))
-    {
-        return false;
-    }
-
-    *value = (uint32_t)parsed;
-    return true;
-}
-
 static bool playback_parse_content_range(const char *text, playback_content_range_t *range)
 {
     const char *cursor;
@@ -392,11 +373,11 @@ playback_http_result_t playback_http_range_probe(
 )
 {
     http_client_response_t response;
-    http_client_header_t headers[1U];
+    http_client_header_t headers[2U];
     playback_http_result_t result;
+    playback_content_range_t parsed_range;
     uint8_t header_count = 0U;
-    char content_length_text[24U];
-    char accept_ranges[32U];
+    char content_range_text[80U];
     char etag[PLAYBACK_ETAG_MAX_LEN + 1U];
     uint32_t content_length;
 
@@ -409,7 +390,11 @@ playback_http_result_t playback_http_range_probe(
         return PLAYBACK_HTTP_CANCELLED;
     }
 
-    if ((reader->config.authorization != NULL) && (reader->config.authorization[0] != '\0'))
+    headers[header_count].key = "Range";
+    headers[header_count].value = "bytes=0-0";
+    ++header_count;
+    if ((reader->config.authorization != NULL) &&
+        (reader->config.authorization[0] != '\0'))
     {
         headers[header_count].key = "Authorization";
         headers[header_count].value = reader->config.authorization;
@@ -418,8 +403,8 @@ playback_http_result_t playback_http_range_probe(
 
     result = playback_http_request_with_retry(
         reader,
-        HTTP_METHOD_HEAD,
-        (header_count > 0U) ? headers : NULL,
+        HTTP_METHOD_GET,
+        headers,
         header_count,
         &response
     );
@@ -428,24 +413,40 @@ playback_http_result_t playback_http_range_probe(
         return result;
     }
 
-    if (response.status_code != 200U)
-    {
-        http_client_free(&response);
-        return PLAYBACK_HTTP_STATUS_ERROR;
-    }
-    if (!playback_header_value(response.headers, response.headers_length, "Content-Length", content_length_text,
-                               sizeof(content_length_text)) ||
-        !playback_parse_u32(content_length_text, &content_length) ||
-        !playback_header_value(response.headers, response.headers_length, "ETag", etag, sizeof(etag)) ||
-        !playback_header_value(response.headers, response.headers_length, "Accept-Ranges", accept_ranges,
-                               sizeof(accept_ranges)))
+    if ((response.status_code != 206U) ||
+        !playback_header_value(
+            response.headers,
+            response.headers_length,
+            "Content-Range",
+            content_range_text,
+            sizeof(content_range_text)
+        ) ||
+        !playback_parse_content_range(content_range_text, &parsed_range) ||
+        !playback_header_value(
+            response.headers,
+            response.headers_length,
+            "ETag",
+            etag,
+            sizeof(etag)
+        ) ||
+        (parsed_range.start != 0U) ||
+        (parsed_range.end != 0U) ||
+        (parsed_range.total == 0U) ||
+        (response.body_length != 1U))
     {
         http_client_free(&response);
         return PLAYBACK_HTTP_RESOURCE_MISMATCH;
     }
 
-    if ((content_length != reader->asset.byte_length) || (strcmp(etag, reader->asset.etag) != 0) ||
-        !playback_ascii_equal_ignore_case(accept_ranges, strlen(accept_ranges), "bytes"))
+    content_length = parsed_range.total;
+    if (reader->config.discover_metadata)
+    {
+        reader->asset.byte_length = content_length;
+        strncpy(reader->asset.etag, etag, sizeof(reader->asset.etag) - 1U);
+        reader->asset.etag[sizeof(reader->asset.etag) - 1U] = '\0';
+    }
+    else if ((content_length != reader->asset.byte_length) ||
+             (strcmp(etag, reader->asset.etag) != 0))
     {
         http_client_free(&response);
         return PLAYBACK_HTTP_RESOURCE_MISMATCH;
@@ -460,12 +461,11 @@ playback_http_result_t playback_http_range_probe(
     return PLAYBACK_HTTP_OK;
 }
 
-playback_http_result_t playback_http_range_read_at(
+static playback_http_result_t playback_http_range_read_slice(
     playback_http_range_reader_t *reader,
     uint32_t offset,
     uint32_t length,
-    uint8_t *destination,
-    size_t destination_capacity
+    uint8_t *destination
 )
 {
     http_client_response_t response;
@@ -478,19 +478,14 @@ playback_http_result_t playback_http_range_read_at(
     uint64_t requested_end;
     uint8_t header_count = 0U;
 
-    if ((reader == NULL) || (destination == NULL) || (length == 0U) || (length > destination_capacity) ||
-        (length > PLAYBACK_HTTP_RANGE_MAX_LENGTH))
-    {
-        return PLAYBACK_HTTP_INVALID_ARGUMENT;
-    }
-
     requested_end = (uint64_t)offset + (uint64_t)length - 1ULL;
-    if ((requested_end >= reader->asset.byte_length) || reader->cancelled)
-    {
-        return reader->cancelled ? PLAYBACK_HTTP_CANCELLED : PLAYBACK_HTTP_RANGE_INVALID;
-    }
-
-    snprintf(range_value, sizeof(range_value), "bytes=%lu-%lu", (unsigned long)offset, (unsigned long)requested_end);
+    (void)snprintf(
+        range_value,
+        sizeof(range_value),
+        "bytes=%lu-%lu",
+        (unsigned long)offset,
+        (unsigned long)requested_end
+    );
     headers[header_count].key = "Range";
     headers[header_count].value = range_value;
     ++header_count;
@@ -500,7 +495,8 @@ playback_http_result_t playback_http_range_read_at(
     headers[header_count].key = "Accept-Encoding";
     headers[header_count].value = "identity";
     ++header_count;
-    if ((reader->config.authorization != NULL) && (reader->config.authorization[0] != '\0'))
+    if ((reader->config.authorization != NULL) &&
+        (reader->config.authorization[0] != '\0'))
     {
         headers[header_count].key = "Authorization";
         headers[header_count].value = reader->config.authorization;
@@ -535,17 +531,30 @@ playback_http_result_t playback_http_range_read_at(
         return PLAYBACK_HTTP_STATUS_ERROR;
     }
 
-    if (!playback_header_value(response.headers, response.headers_length, "Content-Range", content_range_value,
-                               sizeof(content_range_value)) ||
+    if (!playback_header_value(
+            response.headers,
+            response.headers_length,
+            "Content-Range",
+            content_range_value,
+            sizeof(content_range_value)
+        ) ||
         !playback_parse_content_range(content_range_value, &parsed_range) ||
-        !playback_header_value(response.headers, response.headers_length, "ETag", etag, sizeof(etag)))
+        !playback_header_value(
+            response.headers,
+            response.headers_length,
+            "ETag",
+            etag,
+            sizeof(etag)
+        ))
     {
         http_client_free(&response);
         return PLAYBACK_HTTP_RESOURCE_MISMATCH;
     }
 
-    if ((parsed_range.start != offset) || (parsed_range.end != (uint32_t)requested_end) ||
-        (parsed_range.total != reader->asset.byte_length) || (strcmp(etag, reader->asset.etag) != 0) ||
+    if ((parsed_range.start != offset) ||
+        (parsed_range.end != (uint32_t)requested_end) ||
+        (parsed_range.total != reader->asset.byte_length) ||
+        (strcmp(etag, reader->asset.etag) != 0) ||
         (response.body_length != length))
     {
         http_client_free(&response);
@@ -555,6 +564,61 @@ playback_http_result_t playback_http_range_read_at(
     memcpy(destination, response.body, length);
     http_client_free(&response);
     return reader->cancelled ? PLAYBACK_HTTP_CANCELLED : PLAYBACK_HTTP_OK;
+}
+
+playback_http_result_t playback_http_range_read_at(
+    playback_http_range_reader_t *reader,
+    uint32_t offset,
+    uint32_t length,
+    uint8_t *destination,
+    size_t destination_capacity
+)
+{
+    playback_http_result_t result;
+    uint64_t requested_end;
+    uint32_t copied = 0U;
+
+    if ((reader == NULL) ||
+        (destination == NULL) ||
+        (length == 0U) ||
+        (length > destination_capacity) ||
+        (length > PLAYBACK_HTTP_RANGE_MAX_LENGTH))
+    {
+        return PLAYBACK_HTTP_INVALID_ARGUMENT;
+    }
+
+    requested_end = (uint64_t)offset + (uint64_t)length - 1ULL;
+    if ((requested_end >= reader->asset.byte_length) || reader->cancelled)
+    {
+        return reader->cancelled
+            ? PLAYBACK_HTTP_CANCELLED
+            : PLAYBACK_HTTP_RANGE_INVALID;
+    }
+
+    while (copied < length)
+    {
+        const uint32_t remaining = length - copied;
+        const uint32_t slice_length =
+            (remaining > PLAYBACK_HTTP_REQUEST_SLICE_LENGTH)
+                ? PLAYBACK_HTTP_REQUEST_SLICE_LENGTH
+                : remaining;
+
+        result = playback_http_range_read_slice(
+            reader,
+            offset + copied,
+            slice_length,
+            destination + copied
+        );
+        if (result != PLAYBACK_HTTP_OK)
+        {
+            return result;
+        }
+        copied += slice_length;
+    }
+
+    return reader->cancelled
+        ? PLAYBACK_HTTP_CANCELLED
+        : PLAYBACK_HTTP_OK;
 }
 
 void playback_http_range_cancel(playback_http_range_reader_t *reader)

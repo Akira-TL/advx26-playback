@@ -85,6 +85,8 @@ static bool playback_h264_access_unit_nal_allowed(uint8_t nal_type)
     {
         case PLAYBACK_H264_NAL_TYPE_NON_IDR:
         case PLAYBACK_H264_NAL_TYPE_IDR:
+        case PLAYBACK_H264_NAL_TYPE_SPS:
+        case PLAYBACK_H264_NAL_TYPE_PPS:
         case PLAYBACK_H264_NAL_TYPE_SEI:
         case PLAYBACK_H264_NAL_TYPE_AUD:
         case PLAYBACK_H264_NAL_TYPE_END_SEQUENCE:
@@ -437,7 +439,8 @@ playback_h264_result_t playback_h264_decoder_submit_access_unit(
         return PLAYBACK_H264_INVALID_ACCESS_UNIT;
     }
 
-    if (state->prepend_parameter_sets)
+    if (state->prepend_parameter_sets &&
+        !(access_unit_info.has_sps && access_unit_info.has_pps))
     {
         if (!playback_h264_size_add(state->parameter_sets_length, access_unit_length, &input_length) ||
             (input_length > state->decode_buffer_capacity))

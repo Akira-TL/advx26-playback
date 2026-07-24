@@ -72,6 +72,13 @@ playback_mp4_result_t playback_mp4_demux_open(
     const playback_http_config_t *http_config
 );
 
+/** Open a non-owning in-memory MP4 source. The buffer must outlive the demux. */
+playback_mp4_result_t playback_mp4_demux_open_memory(
+    playback_mp4_demux_t *demux,
+    const uint8_t *data,
+    size_t length
+);
+
 playback_mp4_result_t playback_mp4_demux_get_codec_config(
     const playback_mp4_demux_t *demux,
     playback_mp4_codec_config_t *config,

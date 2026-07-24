@@ -16,6 +16,7 @@
 
 static TIMER_ID playback_wifi_retry_timer;
 static bool playback_wifi_connected;
+static char playback_wifi_gateway[64];
 
 static void playback_wifi_retry_callback(TIMER_ID timer_id, void *argument)
 {
@@ -60,6 +61,8 @@ static void playback_wifi_event_callback(WF_EVENT_E event, void *argument)
                     station_ip.ip,
                     station_ip.gw
                 );
+                strncpy(playback_wifi_gateway, station_ip.gw,
+                        sizeof(playback_wifi_gateway) - 1U);
             }
             else
             {
@@ -159,4 +162,9 @@ OPERATE_RET playback_network_start(void)
         (int8_t *)DEMO_WIFI_PASSWORD
     );
 #endif
+}
+
+const char *playback_network_get_gateway(void)
+{
+    return playback_wifi_gateway;
 }

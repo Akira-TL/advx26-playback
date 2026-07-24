@@ -26,6 +26,15 @@ typedef struct
     void *context;
 } mob_screen_bluetooth_callbacks_t;
 
+typedef void (*mob_screen_speaker_test_cb)(void *context);
+typedef void (*mob_screen_video_test_cb)(void *context);
+
+/** Configure optional speaker-test action before creating the screen. */
+void mob_screen_set_speaker_test_callback(mob_screen_speaker_test_cb on_speaker_test, void *context);
+
+/** Configure optional H.264 video-test action before creating the screen. */
+void mob_screen_set_video_test_callback(mob_screen_video_test_cb on_video_test, void *context);
+
 /** Configure Bluetooth-page actions before creating the screen. */
 void mob_screen_set_bluetooth_callbacks(
     const mob_screen_bluetooth_callbacks_t *callbacks

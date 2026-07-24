@@ -126,6 +126,9 @@ typedef struct
 {
     playback_http_range_reader_t reader;
     playback_http_metadata_t metadata;
+    const uint8_t *memory_data;
+    size_t memory_length;
+    bool memory_source;
     playback_mp4_codec_config_t codec;
     playback_mp4_sample_t *samples;
     uint8_t *sample_scratch;
@@ -285,6 +288,43 @@ static playback_mp4_result_t playback_mp4_map_http_result(playback_http_result_t
     }
 }
 
+static playback_mp4_result_t playback_mp4_read_at(
+    playback_mp4_state_t *state,
+    uint32_t offset,
+    uint32_t length,
+    uint8_t *destination,
+    size_t destination_capacity
+)
+{
+    playback_http_result_t http_result;
+
+    if ((state == NULL) || (destination == NULL) || (length == 0U) ||
+        (length > destination_capacity))
+    {
+        return PLAYBACK_MP4_INVALID_ARGUMENT;
+    }
+
+    if (state->memory_source)
+    {
+        if (((uint64_t)offset + length > state->memory_length) ||
+            (state->memory_data == NULL))
+        {
+            return PLAYBACK_MP4_INVALID_CONTAINER;
+        }
+        memcpy(destination, state->memory_data + offset, length);
+        return PLAYBACK_MP4_OK;
+    }
+
+    http_result = playback_http_range_read_at(
+        &state->reader,
+        offset,
+        length,
+        destination,
+        destination_capacity
+    );
+    return playback_mp4_map_http_result(http_result);
+}
+
 static playback_mp4_result_t playback_mp4_read_file_box(
     playback_mp4_state_t *state,
     uint32_t offset,
@@ -295,7 +335,7 @@ static playback_mp4_result_t playback_mp4_read_file_box(
     uint32_t size32;
     uint64_t size64;
     uint64_t box_end;
-    playback_http_result_t http_result;
+    playback_mp4_result_t read_result;
 
     if ((state == NULL) || (box == NULL) || (offset >= state->metadata.content_length) ||
         (state->metadata.content_length - offset < 8U))
@@ -303,10 +343,10 @@ static playback_mp4_result_t playback_mp4_read_file_box(
         return PLAYBACK_MP4_INVALID_CONTAINER;
     }
 
-    http_result = playback_http_range_read_at(&state->reader, offset, 8U, header, sizeof(header));
-    if (http_result != PLAYBACK_HTTP_OK)
+    read_result = playback_mp4_read_at(state, offset, 8U, header, sizeof(header));
+    if (read_result != PLAYBACK_MP4_OK)
     {
-        return playback_mp4_map_http_result(http_result);
+        return read_result;
     }
 
     memset(box, 0, sizeof(*box));
@@ -321,10 +361,10 @@ static playback_mp4_result_t playback_mp4_read_file_box(
         {
             return PLAYBACK_MP4_INVALID_CONTAINER;
         }
-        http_result = playback_http_range_read_at(&state->reader, offset + 8U, 8U, header + 8U, 8U);
-        if (http_result != PLAYBACK_HTTP_OK)
+        read_result = playback_mp4_read_at(state, offset + 8U, 8U, header + 8U, 8U);
+        if (read_result != PLAYBACK_MP4_OK)
         {
-            return playback_mp4_map_http_result(http_result);
+            return read_result;
         }
         size64 = playback_mp4_read_be64(header + 8U);
         if ((size64 > UINT32_MAX) || (size64 < 16U))
@@ -430,16 +470,15 @@ static playback_mp4_result_t playback_mp4_scan_file(
         if (box.type == MP4_BOX_FTYP)
         {
             uint8_t ftyp[PLAYBACK_MP4_FTYP_MAX_BYTES];
-            playback_http_result_t http_result;
 
             if (ftyp_found || (offset != 0U) || (box.size > sizeof(ftyp)))
             {
                 return PLAYBACK_MP4_UNSUPPORTED_CONTAINER;
             }
-            http_result = playback_http_range_read_at(&state->reader, box.offset, box.size, ftyp, sizeof(ftyp));
-            if (http_result != PLAYBACK_HTTP_OK)
+            result = playback_mp4_read_at(state, box.offset, box.size, ftyp, sizeof(ftyp));
+            if (result != PLAYBACK_MP4_OK)
             {
-                return playback_mp4_map_http_result(http_result);
+                return result;
             }
             result = playback_mp4_validate_ftyp(ftyp, box.size, box.header_size);
             if (result != PLAYBACK_MP4_OK)
@@ -454,8 +493,6 @@ static playback_mp4_result_t playback_mp4_scan_file(
         }
         else if (box.type == MP4_BOX_MOOV)
         {
-            playback_http_result_t http_result;
-
             if (!ftyp_found || moov_found || mdat_found || (box.size > PLAYBACK_MP4_MAX_MOOV_BYTES) ||
                 (box.size > PLAYBACK_HTTP_RANGE_MAX_LENGTH))
             {
@@ -467,12 +504,12 @@ static playback_mp4_result_t playback_mp4_scan_file(
             {
                 return PLAYBACK_MP4_NO_MEMORY;
             }
-            http_result = playback_http_range_read_at(&state->reader, box.offset, box.size, *moov_buffer, box.size);
-            if (http_result != PLAYBACK_HTTP_OK)
+            result = playback_mp4_read_at(state, box.offset, box.size, *moov_buffer, box.size);
+            if (result != PLAYBACK_MP4_OK)
             {
                 tal_free(*moov_buffer);
                 *moov_buffer = NULL;
-                return playback_mp4_map_http_result(http_result);
+                return result;
             }
             *moov_size = box.size;
             *moov_header_size = box.header_size;
@@ -1720,6 +1757,62 @@ playback_mp4_result_t playback_mp4_demux_open(
     return PLAYBACK_MP4_OK;
 }
 
+playback_mp4_result_t playback_mp4_demux_open_memory(
+    playback_mp4_demux_t *demux,
+    const uint8_t *data,
+    size_t length
+)
+{
+    playback_mp4_state_t *state;
+    uint8_t *moov_buffer = NULL;
+    size_t moov_size = 0U;
+    size_t moov_header_size = 0U;
+    playback_mp4_result_t result;
+
+    if ((demux == NULL) || (data == NULL) || (length == 0U) ||
+        (length > UINT32_MAX) || (demux->state != NULL))
+    {
+        return PLAYBACK_MP4_INVALID_ARGUMENT;
+    }
+
+    state = tal_calloc(1U, sizeof(*state));
+    if (state == NULL)
+    {
+        return PLAYBACK_MP4_NO_MEMORY;
+    }
+
+    state->memory_data = data;
+    state->memory_length = length;
+    state->memory_source = true;
+    state->metadata.content_length = (uint32_t)length;
+    state->metadata.accepts_byte_ranges = true;
+
+    result = playback_mp4_scan_file(state, &moov_buffer, &moov_size, &moov_header_size);
+    if (result == PLAYBACK_MP4_OK)
+    {
+        result = playback_mp4_parse_moov(moov_buffer, moov_size, moov_header_size, state);
+    }
+    if (moov_buffer != NULL)
+    {
+        tal_free(moov_buffer);
+    }
+    if (result != PLAYBACK_MP4_OK)
+    {
+        playback_mp4_state_release(state);
+        return result;
+    }
+
+    state->sample_scratch = tal_malloc(state->codec.max_sample_size);
+    if (state->sample_scratch == NULL)
+    {
+        playback_mp4_state_release(state);
+        return PLAYBACK_MP4_NO_MEMORY;
+    }
+    state->sample_scratch_capacity = state->codec.max_sample_size;
+    demux->state = state;
+    return PLAYBACK_MP4_OK;
+}
+
 playback_mp4_result_t playback_mp4_demux_get_codec_config(
     const playback_mp4_demux_t *demux,
     playback_mp4_codec_config_t *config,
@@ -1890,7 +1983,7 @@ playback_mp4_result_t playback_mp4_demux_read_access_unit(
 {
     playback_mp4_state_t *state = playback_mp4_get_state(demux);
     const playback_mp4_sample_t *sample;
-    playback_http_result_t http_result;
+    playback_mp4_result_t read_result;
     size_t cursor = 0U;
     size_t required = 0U;
     uint32_t nal_count = 0U;
@@ -1914,16 +2007,16 @@ playback_mp4_result_t playback_mp4_demux_read_access_unit(
         return PLAYBACK_MP4_CONTENT_INVALID;
     }
 
-    http_result = playback_http_range_read_at(
-        &state->reader,
+    read_result = playback_mp4_read_at(
+        state,
         sample->byte_offset,
         sample->byte_length,
         state->sample_scratch,
         state->sample_scratch_capacity
     );
-    if (http_result != PLAYBACK_HTTP_OK)
+    if (read_result != PLAYBACK_MP4_OK)
     {
-        return playback_mp4_map_http_result(http_result);
+        return read_result;
     }
 
     while (cursor < sample->byte_length)
@@ -1990,7 +2083,7 @@ playback_mp4_result_t playback_mp4_demux_read_access_unit(
 void playback_mp4_demux_cancel(playback_mp4_demux_t *demux)
 {
     playback_mp4_state_t *state = playback_mp4_get_state(demux);
-    if (state != NULL)
+    if ((state != NULL) && !state->memory_source)
     {
         playback_http_range_cancel(&state->reader);
     }

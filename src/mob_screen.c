@@ -35,10 +35,16 @@ static lv_obj_t *bluetooth_screen = NULL;
 static lv_obj_t *bluetooth_list = NULL;
 static lv_obj_t *bluetooth_status = NULL;
 static lv_obj_t *bluetooth_scan_button = NULL;
+static lv_obj_t *speaker_test_button = NULL;
+static lv_obj_t *video_test_button = NULL;
 static lv_img_dsc_t video_frame_descriptor;
 static uint16_t *video_frame_pixels = NULL;
 static size_t video_frame_bytes = 0U;
 static mob_screen_bluetooth_callbacks_t bluetooth_callbacks;
+static mob_screen_speaker_test_cb speaker_test_callback = NULL;
+static void *speaker_test_context = NULL;
+static mob_screen_video_test_cb video_test_callback = NULL;
+static void *video_test_context = NULL;
 
 typedef struct
 {
@@ -373,6 +379,26 @@ static void mob_bluetooth_scan_event(lv_event_t *event)
     }
 }
 
+static void mob_speaker_test_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED)
+    {
+        if (speaker_test_callback != NULL)
+        {
+            speaker_test_callback(speaker_test_context);
+        }
+    }
+}
+
+static void mob_video_test_event(lv_event_t *event)
+{
+    if ((lv_event_get_code(event) == LV_EVENT_CLICKED) &&
+        (video_test_callback != NULL))
+    {
+        video_test_callback(video_test_context);
+    }
+}
+
 static void mob_bluetooth_device_event(lv_event_t *event)
 {
     mob_bluetooth_row_t *row;
@@ -515,6 +541,44 @@ static bool configure_bluetooth_screen(void)
     );
     lv_obj_center(scan_label);
 
+    speaker_test_button = lv_btn_create(bluetooth_screen);
+    lv_obj_set_size(speaker_test_button, 84, 34);
+    lv_obj_align(speaker_test_button, LV_ALIGN_TOP_RIGHT, -112, 16);
+    lv_obj_set_style_bg_color(speaker_test_button, MOB_COLOR_ACCENT_DARK, 0);
+    lv_obj_set_style_radius(speaker_test_button, 17, 0);
+    lv_obj_add_event_cb(
+        speaker_test_button,
+        mob_speaker_test_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+    lv_obj_t *test_label = create_label(
+        speaker_test_button,
+        "AUDIO",
+        MOB_COLOR_ACCENT,
+        LV_TEXT_ALIGN_CENTER
+    );
+    lv_obj_center(test_label);
+
+    video_test_button = lv_btn_create(bluetooth_screen);
+    lv_obj_set_size(video_test_button, 84, 34);
+    lv_obj_align(video_test_button, LV_ALIGN_TOP_RIGHT, -202, 16);
+    lv_obj_set_style_bg_color(video_test_button, MOB_COLOR_ACCENT_DARK, 0);
+    lv_obj_set_style_radius(video_test_button, 17, 0);
+    lv_obj_add_event_cb(
+        video_test_button,
+        mob_video_test_event,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+    lv_obj_t *video_label = create_label(
+        video_test_button,
+        "VIDEO",
+        MOB_COLOR_ACCENT,
+        LV_TEXT_ALIGN_CENTER
+    );
+    lv_obj_center(video_label);
+
     bluetooth_status = create_label(
         bluetooth_screen,
         "Ready to scan",
@@ -548,6 +612,24 @@ void mob_screen_set_bluetooth_callbacks(
         return;
     }
     bluetooth_callbacks = *callbacks;
+}
+
+void mob_screen_set_speaker_test_callback(
+    mob_screen_speaker_test_cb on_speaker_test,
+    void *context
+)
+{
+    speaker_test_callback = on_speaker_test;
+    speaker_test_context = context;
+}
+
+void mob_screen_set_video_test_callback(
+    mob_screen_video_test_cb on_video_test,
+    void *context
+)
+{
+    video_test_callback = on_video_test;
+    video_test_context = context;
 }
 
 void mob_screen_create(void)
