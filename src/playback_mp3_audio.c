@@ -24,6 +24,7 @@ typedef struct
     size_t compressed_capacity;
     int16_t *decoded_pcm;
     int16_t *pcm_ring;
+    MUTEX_HANDLE pcm_mutex;
     size_t pcm_ring_capacity_samples;
     size_t pcm_ring_read;
     size_t pcm_ring_write;
@@ -113,7 +114,12 @@ static uint64_t playback_mp3_record_end_frame(
 
 static uint32_t playback_mp3_available_frames(const playback_mp3_audio_state_t *state)
 {
-    return (uint32_t)(state->pcm_ring_count / state->descriptor.channels);
+    uint32_t frames;
+
+    tal_mutex_lock(state->pcm_mutex);
+    frames = (uint32_t)(state->pcm_ring_count / state->descriptor.channels);
+    tal_mutex_unlock(state->pcm_mutex);
+    return frames;
 }
 
 static size_t playback_mp3_free_samples(const playback_mp3_audio_state_t *state)
@@ -242,6 +248,10 @@ static void playback_mp3_release_state(playback_mp3_audio_state_t *state)
     {
         MP3FreeDecoder(state->decoder);
     }
+    if (state->pcm_mutex != NULL)
+    {
+        tal_mutex_release(state->pcm_mutex);
+    }
     if (state->pcm_ring != NULL)
     {
         tal_psram_free(state->pcm_ring);
@@ -366,8 +376,11 @@ static playback_mp3_result_t playback_mp3_append_timeline(
 
     decoded_copy_samples = (size_t)decoded_copy_frames * state->descriptor.channels;
     silence_samples = (size_t)(append_frames - decoded_copy_frames) * state->descriptor.channels;
+
+    tal_mutex_lock(state->pcm_mutex);
     if ((decoded_copy_samples + silence_samples) > playback_mp3_free_samples(state))
     {
+        tal_mutex_unlock(state->pcm_mutex);
         return PLAYBACK_MP3_BUFFER_FULL;
     }
 
@@ -378,12 +391,15 @@ static playback_mp3_result_t playback_mp3_append_timeline(
             decoded_copy_samples
         ))
     {
+        tal_mutex_unlock(state->pcm_mutex);
         return PLAYBACK_MP3_BUFFER_FULL;
     }
     if ((silence_samples > 0U) && !playback_mp3_ring_write_samples(state, NULL, silence_samples))
     {
+        tal_mutex_unlock(state->pcm_mutex);
         return PLAYBACK_MP3_BUFFER_FULL;
     }
+    tal_mutex_unlock(state->pcm_mutex);
 
     return PLAYBACK_MP3_OK;
 }
@@ -410,9 +426,14 @@ static playback_mp3_result_t playback_mp3_append_silence(
         return PLAYBACK_MP3_INDEX_INVALID;
     }
     sample_count = (size_t)frame_count * state->descriptor.channels;
-    return playback_mp3_ring_write_samples(state, NULL, sample_count)
-               ? PLAYBACK_MP3_OK
-               : PLAYBACK_MP3_BUFFER_FULL;
+    tal_mutex_lock(state->pcm_mutex);
+    if (!playback_mp3_ring_write_samples(state, NULL, sample_count))
+    {
+        tal_mutex_unlock(state->pcm_mutex);
+        return PLAYBACK_MP3_BUFFER_FULL;
+    }
+    tal_mutex_unlock(state->pcm_mutex);
+    return PLAYBACK_MP3_OK;
 }
 
 static playback_mp3_result_t playback_mp3_decode_current_record(
@@ -533,8 +554,10 @@ static playback_mp3_result_t playback_mp3_recover_record(
         (failure == PLAYBACK_MP3_UNSUPPORTED_FORMAT) ||
         (failure == PLAYBACK_MP3_NO_MEMORY))
     {
+        tal_mutex_lock(state->pcm_mutex);
         state->fatal = true;
         state->last_failure = failure;
+        tal_mutex_unlock(state->pcm_mutex);
         return failure;
     }
 
@@ -548,8 +571,10 @@ static playback_mp3_result_t playback_mp3_recover_record(
     if ((state->consecutive_failures >= PLAYBACK_MP3_MAX_CONSECUTIVE_FAILURES) ||
         ((uint32_t)(now - state->failure_started_ms) > PLAYBACK_MP3_RECOVERY_DEADLINE_MS))
     {
+        tal_mutex_lock(state->pcm_mutex);
         state->fatal = true;
         state->last_failure = PLAYBACK_MP3_RECOVERY_FAILED;
+        tal_mutex_unlock(state->pcm_mutex);
         return PLAYBACK_MP3_RECOVERY_FAILED;
     }
 
@@ -563,8 +588,10 @@ static playback_mp3_result_t playback_mp3_recover_record(
 
     if (!playback_mp3_decoder_reset(state))
     {
+        tal_mutex_lock(state->pcm_mutex);
         state->fatal = true;
         state->last_failure = PLAYBACK_MP3_NO_MEMORY;
+        tal_mutex_unlock(state->pcm_mutex);
         return PLAYBACK_MP3_NO_MEMORY;
     }
 
@@ -658,6 +685,11 @@ playback_mp3_result_t playback_mp3_audio_prepare(
     state->low_water_frames = (descriptor->sample_rate * PLAYBACK_MP3_PCM_LOW_WATER_MS) / 1000U;
     state->high_water_frames = (descriptor->sample_rate * PLAYBACK_MP3_PCM_HIGH_WATER_MS) / 1000U;
     state->last_failure = PLAYBACK_MP3_OK;
+    if (tal_mutex_create_init(&state->pcm_mutex) != OPRT_OK)
+    {
+        playback_mp3_release_state(state);
+        return PLAYBACK_MP3_NO_MEMORY;
+    }
 
     ring_capacity_frames = (uint64_t)state->high_water_frames + maximum_frame_span;
     ring_capacity_samples = ring_capacity_frames * descriptor->channels;
@@ -716,16 +748,21 @@ playback_mp3_result_t playback_mp3_audio_fill(playback_mp3_audio_t *audio)
         return PLAYBACK_MP3_NOT_OPEN;
     }
     state = audio->state;
+    tal_mutex_lock(state->pcm_mutex);
     if (state->fatal)
     {
-        return (state->last_failure == PLAYBACK_MP3_OK)
-                   ? PLAYBACK_MP3_RECOVERY_FAILED
-                   : state->last_failure;
+        const playback_mp3_result_t failure = (state->last_failure == PLAYBACK_MP3_OK)
+                                                  ? PLAYBACK_MP3_RECOVERY_FAILED
+                                                  : state->last_failure;
+        tal_mutex_unlock(state->pcm_mutex);
+        return failure;
     }
     if (state->fetch_paused)
     {
+        tal_mutex_unlock(state->pcm_mutex);
         return PLAYBACK_MP3_FETCH_PAUSED;
     }
+    tal_mutex_unlock(state->pcm_mutex);
     if (playback_mp3_available_frames(state) >= state->high_water_frames)
     {
         return PLAYBACK_MP3_OK;
@@ -748,14 +785,19 @@ playback_mp3_result_t playback_mp3_audio_fill(playback_mp3_audio_t *audio)
 
     if (state->next_record >= state->record_count)
     {
+        tal_mutex_lock(state->pcm_mutex);
         state->source_exhausted = true;
+        tal_mutex_unlock(state->pcm_mutex);
     }
 
     if (progressed || (playback_mp3_available_frames(state) > 0U))
     {
         return PLAYBACK_MP3_OK;
     }
-    return state->source_exhausted ? PLAYBACK_MP3_END_OF_STREAM : PLAYBACK_MP3_BUFFER_EMPTY;
+    tal_mutex_lock(state->pcm_mutex);
+    progressed = state->source_exhausted;
+    tal_mutex_unlock(state->pcm_mutex);
+    return progressed ? PLAYBACK_MP3_END_OF_STREAM : PLAYBACK_MP3_BUFFER_EMPTY;
 }
 
 playback_mp3_result_t playback_mp3_audio_consume(
@@ -785,21 +827,29 @@ playback_mp3_result_t playback_mp3_audio_consume(
     }
 
     state = audio->state;
+    tal_mutex_lock(state->pcm_mutex);
     if (state->output_paused)
     {
+        tal_mutex_unlock(state->pcm_mutex);
         return PLAYBACK_MP3_OUTPUT_PAUSED;
     }
     if (state->fatal && (state->pcm_ring_count == 0U))
     {
-        return (state->last_failure == PLAYBACK_MP3_OK)
-                   ? PLAYBACK_MP3_RECOVERY_FAILED
-                   : state->last_failure;
+        const playback_mp3_result_t failure = (state->last_failure == PLAYBACK_MP3_OK)
+                                                  ? PLAYBACK_MP3_RECOVERY_FAILED
+                                                  : state->last_failure;
+        tal_mutex_unlock(state->pcm_mutex);
+        return failure;
     }
 
-    available_frames = playback_mp3_available_frames(state);
+    available_frames = state->pcm_ring_count / state->descriptor.channels;
     if (available_frames == 0U)
     {
-        return state->source_exhausted ? PLAYBACK_MP3_END_OF_STREAM : PLAYBACK_MP3_BUFFER_EMPTY;
+        const playback_mp3_result_t empty_result = state->source_exhausted
+                                                       ? PLAYBACK_MP3_END_OF_STREAM
+                                                       : PLAYBACK_MP3_BUFFER_EMPTY;
+        tal_mutex_unlock(state->pcm_mutex);
+        return empty_result;
     }
 
     selected_frames = (available_frames < destination_frame_capacity)
@@ -809,6 +859,7 @@ playback_mp3_result_t playback_mp3_audio_consume(
     read_samples = playback_mp3_ring_read_samples(state, destination, selected_samples);
     selected_frames = read_samples / state->descriptor.channels;
     state->consumed_pcm_frames += selected_frames;
+    tal_mutex_unlock(state->pcm_mutex);
     if (consumed_frames != NULL)
     {
         *consumed_frames = selected_frames;
@@ -835,6 +886,7 @@ playback_mp3_result_t playback_mp3_audio_seek(
     }
 
     playback_http_range_reset_cancel(&state->reader);
+    tal_mutex_lock(state->pcm_mutex);
     playback_mp3_ring_clear(state);
     state->consumed_pcm_frames = target_pcm_frame;
     state->discard_before_frame = target_pcm_frame;
@@ -843,11 +895,14 @@ playback_mp3_result_t playback_mp3_audio_seek(
     state->consecutive_failures = 0U;
     state->failure_started_ms = 0U;
     state->last_failure = PLAYBACK_MP3_OK;
+    tal_mutex_unlock(state->pcm_mutex);
 
     if (target_pcm_frame == state->expected_pcm_frames)
     {
         state->next_record = state->record_count;
+        tal_mutex_lock(state->pcm_mutex);
         state->source_exhausted = true;
+        tal_mutex_unlock(state->pcm_mutex);
         return playback_mp3_decoder_reset(state) ? PLAYBACK_MP3_OK : PLAYBACK_MP3_NO_MEMORY;
     }
 
@@ -857,8 +912,10 @@ playback_mp3_result_t playback_mp3_audio_seek(
                              : 0U;
     if (!playback_mp3_decoder_reset(state))
     {
+        tal_mutex_lock(state->pcm_mutex);
         state->fatal = true;
         state->last_failure = PLAYBACK_MP3_NO_MEMORY;
+        tal_mutex_unlock(state->pcm_mutex);
         return PLAYBACK_MP3_NO_MEMORY;
     }
     return PLAYBACK_MP3_OK;
@@ -881,14 +938,19 @@ playback_mp3_result_t playback_mp3_audio_pause(
     }
 
     state = audio->state;
+    tal_mutex_lock(state->pcm_mutex);
     if ((flags & PLAYBACK_MP3_PAUSE_FETCH) != 0U)
     {
         state->fetch_paused = true;
-        playback_http_range_cancel(&state->reader);
     }
     if ((flags & PLAYBACK_MP3_PAUSE_OUTPUT) != 0U)
     {
         state->output_paused = true;
+    }
+    tal_mutex_unlock(state->pcm_mutex);
+    if ((flags & PLAYBACK_MP3_PAUSE_FETCH) != 0U)
+    {
+        playback_http_range_cancel(&state->reader);
     }
     return PLAYBACK_MP3_OK;
 }
@@ -913,12 +975,17 @@ playback_mp3_result_t playback_mp3_audio_resume(
     if ((flags & PLAYBACK_MP3_PAUSE_FETCH) != 0U)
     {
         playback_http_range_reset_cancel(&state->reader);
+    }
+    tal_mutex_lock(state->pcm_mutex);
+    if ((flags & PLAYBACK_MP3_PAUSE_FETCH) != 0U)
+    {
         state->fetch_paused = false;
     }
     if ((flags & PLAYBACK_MP3_PAUSE_OUTPUT) != 0U)
     {
         state->output_paused = false;
     }
+    tal_mutex_unlock(state->pcm_mutex);
     return PLAYBACK_MP3_OK;
 }
 
@@ -940,6 +1007,7 @@ playback_mp3_result_t playback_mp3_audio_get_status(
 
     state = audio->state;
     memset(status, 0, sizeof(*status));
+    tal_mutex_lock(state->pcm_mutex);
     status->open = true;
     status->fetch_paused = state->fetch_paused;
     status->output_paused = state->output_paused;
@@ -949,13 +1017,14 @@ playback_mp3_result_t playback_mp3_audio_get_status(
     status->sample_rate = state->descriptor.sample_rate;
     status->low_water_frames = state->low_water_frames;
     status->high_water_frames = state->high_water_frames;
-    status->available_pcm_frames = playback_mp3_available_frames(state);
+    status->available_pcm_frames = (uint32_t)(state->pcm_ring_count / state->descriptor.channels);
     status->consumed_pcm_frames = state->consumed_pcm_frames;
     status->expected_pcm_frames = state->expected_pcm_frames;
     status->next_index_record = state->next_record;
     status->consecutive_failures = state->consecutive_failures;
     status->recovered_frame_count = state->recovered_frame_count;
     status->last_failure = state->last_failure;
+    tal_mutex_unlock(state->pcm_mutex);
     return PLAYBACK_MP3_OK;
 }
 
