@@ -187,6 +187,7 @@ OPERATE_RET playback_app_start(void)
     mob_screen_create();
     lv_vendor_disp_unlock();
     lv_vendor_start(5U, 1024U * 8U);
+    mob_screen_neutralize_panel();
 
     result = playback_network_start();
     if (result != OPRT_OK)

@@ -14,6 +14,14 @@ extern "C" {
  */
 void mob_screen_create(void);
 
+/**
+ * @brief Alternate full-screen white and black frames to reduce LCD image retention.
+ *
+ * The LVGL worker must already be running. This function acquires the display
+ * lock internally and restores the idle screen before returning.
+ */
+void mob_screen_neutralize_panel(void);
+
 /** Show a minimal output-only state screen without disturbing paused/completed video. */
 void mob_screen_show_state(playback_state_t state, const char *diagnostic);
 

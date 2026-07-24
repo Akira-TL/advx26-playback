@@ -21,6 +21,8 @@
 #define MOB_COLOR_ACCENT lv_color_hex(0x74F0C5)
 #define MOB_COLOR_ACCENT_DARK lv_color_hex(0x183C34)
 #define MOB_LVGL_IMAGE_DIMENSION_MAX (2047U)
+#define MOB_PANEL_NEUTRALIZE_STEPS (4U)
+#define MOB_PANEL_NEUTRALIZE_HOLD_MS (250U)
 
 static lv_obj_t *idle_screen = NULL;
 static lv_obj_t *status_screen = NULL;
@@ -320,6 +322,58 @@ void mob_screen_create(void)
 
     idle_screen = screen;
     lv_disp_load_scr(screen);
+}
+
+void mob_screen_neutralize_panel(void)
+{
+    lv_disp_t *display;
+    lv_obj_t *neutral_screen;
+    uint8_t step;
+
+    lv_vendor_disp_lock();
+    display = lv_disp_get_default();
+    if (display == NULL)
+    {
+        lv_vendor_disp_unlock();
+        return;
+    }
+
+    neutral_screen = lv_obj_create(NULL);
+    if (neutral_screen == NULL)
+    {
+        lv_vendor_disp_unlock();
+        return;
+    }
+
+    lv_obj_set_style_border_width(neutral_screen, 0, 0);
+    lv_obj_set_style_pad_all(neutral_screen, 0, 0);
+    lv_obj_clear_flag(neutral_screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_disp_load_scr(neutral_screen);
+    lv_vendor_disp_unlock();
+
+    for (step = 0U; step < MOB_PANEL_NEUTRALIZE_STEPS; ++step)
+    {
+        lv_vendor_disp_lock();
+        lv_obj_set_style_bg_color(
+            neutral_screen,
+            ((step & 1U) == 0U) ? lv_color_white() : lv_color_black(),
+            0
+        );
+        lv_obj_set_style_bg_opa(neutral_screen, LV_OPA_COVER, 0);
+        lv_obj_invalidate(neutral_screen);
+        lv_refr_now(display);
+        lv_vendor_disp_unlock();
+        tal_system_sleep(MOB_PANEL_NEUTRALIZE_HOLD_MS);
+    }
+
+    lv_vendor_disp_lock();
+    if (idle_screen != NULL)
+    {
+        lv_disp_load_scr(idle_screen);
+        lv_refr_now(display);
+    }
+    lv_obj_del(neutral_screen);
+    lv_vendor_disp_unlock();
 }
 
 void mob_screen_show_state(playback_state_t state, const char *diagnostic)
