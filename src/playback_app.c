@@ -19,6 +19,10 @@
 #include "tal_api.h"
 #include "tkl_output.h"
 
+#if defined(TUYA_T5AI_BOARD_LCD_35565) && (TUYA_T5AI_BOARD_LCD_35565 == 1)
+#include "tdd_disp_ili9488.h"
+#endif
+
 #ifndef DEMO_SPEAKER_ADDRESS
 #define DEMO_SPEAKER_ADDRESS {0U, 0U, 0U, 0U, 0U, 0U}
 #endif
@@ -37,6 +41,43 @@ typedef struct
 static playback_app_state_t playback_app_state;
 static const uint8_t playback_app_speaker_address[PLAYBACK_SPEAKER_LINK_ADDRESS_BYTES] =
     DEMO_SPEAKER_ADDRESS;
+
+#if defined(TUYA_T5AI_BOARD_LCD_35565) && (TUYA_T5AI_BOARD_LCD_35565 == 1)
+static const uint8_t playback_ili9488_init_sequence[] = {
+    1, 120, ILI9488_SWRESET,
+    3, 0, ILI9488_PWCTR1, 0x0E, 0x0E,
+    2, 0, ILI9488_PWCTR2, 0x46,
+    4, 0, ILI9488_VMCTR1, 0x00, 0x2D, 0x80,
+    2, 0, ILI9488_IFMODE, 0x00,
+    2, 0, ILI9488_FRMCTR1, 0xA0,
+    2, 0, ILI9488_INVCTR, 0x02,
+    5, 0, ILI9488_PRCTR, 0x08, 0x0C, 0x50, 0x64,
+    3, 0, ILI9488_DFUNCTR, 0x32, 0x02,
+    2, 0, ILI9488_MADCTL, 0x48,
+    2, 0, ILI9488_PIXFMT, 0x70,
+    1, 0, ILI9488_INVON,
+    2, 0, ILI9488_SETIMAGE, 0x01,
+    5, 0, ILI9488_ACTRL3, 0xA9, 0x51, 0x2C, 0x82,
+    3, 0, ILI9488_ACTRL4, 0x21, 0x05,
+    16, 0, ILI9488_GMCTRP1, 0x00, 0x0C, 0x10, 0x03, 0x0F, 0x05, 0x37, 0x66,
+        0x4D, 0x03, 0x0C, 0x0A, 0x2F, 0x35, 0x0F,
+    16, 0, ILI9488_GMCTRN1, 0x00, 0x0F, 0x16, 0x06, 0x13, 0x07, 0x3B, 0x35,
+        0x51, 0x07, 0x10, 0x0D, 0x36, 0x3B, 0x0F,
+    1, 120, ILI9488_SLPOUT,
+    1, 20, ILI9488_DISPON,
+    0,
+};
+
+static OPERATE_RET playback_app_prepare_display_panel(void)
+{
+    return tdd_disp_rgb_ili9488_set_init_seq(playback_ili9488_init_sequence);
+}
+#else
+static OPERATE_RET playback_app_prepare_display_panel(void)
+{
+    return OPRT_OK;
+}
+#endif
 
 static bool playback_app_speaker_configured(void)
 {
@@ -180,6 +221,13 @@ OPERATE_RET playback_app_start(void)
 
     tal_log_init(TAL_LOG_LEVEL_DEBUG, 4096U, (TAL_LOG_OUTPUT_CB)tkl_log_output);
     playback_app_log_information();
+
+    result = playback_app_prepare_display_panel();
+    if (result != OPRT_OK)
+    {
+        PR_ERR("Playback display panel preparation failed: %d", result);
+        return result;
+    }
 
     board_register_hardware();
     lv_vendor_init(DISPLAY_NAME);
