@@ -82,6 +82,16 @@ diff --git a/native/h264bsd_decoder.c b/native/h264bsd_decoder.c
 index 57dbdc0..e8d4d2b 100644
 --- a/native/h264bsd_decoder.c
 +++ b/native/h264bsd_decoder.c
+@@ -93,8 +93,8 @@ u32 h264bsdInit(storage_t *pStorage, u32 noOutputReordering)
+     /* allocate mbLayer to be next multiple of 64 to enable use of
+      * specific NEON optimized "memset" for clearing the structure */
+     size = (sizeof(macroblockLayer_t) + 63) & ~0x3F;
+ 
+-    pStorage->mbLayer = (macroblockLayer_t*)malloc(size);
++    pStorage->mbLayer = (macroblockLayer_t*)H264BSD_MALLOC(size);
+     if (!pStorage->mbLayer)
+         return HANTRO_NOK;
+ 
 @@ -498,7 +498,6 @@ u32 h264bsdDecodeInternal(storage_t *pStorage, u8 *byteStrm, u32 len,
  }
  
