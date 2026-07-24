@@ -28,6 +28,16 @@ include/
 src/
 ```
 
+## Local device configuration
+
+Copy the tracked template before building:
+
+```bash
+cp include/demo_network_config.example.h include/demo_network_config.h
+```
+
+`include/demo_network_config.h` is intentionally ignored because it contains Wi-Fi credentials, the fixed Playback Bearer authorization value, and the target speaker address. Beken classic Bluetooth addresses are stored in reverse byte order: visible `AA:BB:CC:DD:EE:FF` becomes `{0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA}`.
+
 ## Build
 
 The parent `advx26` repository owns shared TuyaOpen SDK patching and integration checks. From the parent checkout:
