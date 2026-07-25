@@ -85,6 +85,19 @@ playback_mp3_result_t playback_mp3_audio_prepare(
 );
 
 /**
+ * Prepare the indexed decoder from a caller-owned complete MP3 image.
+ * The memory must remain valid until playback_mp3_audio_close().
+ */
+playback_mp3_result_t playback_mp3_audio_prepare_memory(
+    playback_mp3_audio_t *audio,
+    const playback_audio_descriptor_t *descriptor,
+    const playback_audio_index_t *index,
+    uint32_t duration_ms,
+    const uint8_t *data,
+    size_t data_length
+);
+
+/**
  * @brief Fill the bounded PCM ring toward its high-water mark.
  *
  * One call may issue several indexed HTTP Range reads. Recoverable isolated

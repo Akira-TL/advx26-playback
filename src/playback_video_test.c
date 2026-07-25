@@ -93,12 +93,22 @@ static playback_video_test_result_t playback_video_test_download(
             }
         }
 
-        PR_NOTICE(
-            "VIDEO: HTTP segment offset=%u length=%u failure=%u",
-            (unsigned int)downloaded,
-            (unsigned int)segment_length,
-            (unsigned int)consecutive_failures
-        );
+        if (file->length == 0U)
+        {
+            PR_NOTICE(
+                "VIDEO: HTTP full download request failure=%u",
+                (unsigned int)consecutive_failures
+            );
+        }
+        else
+        {
+            PR_NOTICE(
+                "VIDEO: HTTP resume offset=%u length=%u failure=%u",
+                (unsigned int)downloaded,
+                (unsigned int)segment_length,
+                (unsigned int)consecutive_failures
+            );
+        }
         operation_result = http_open_session(&session, url, 30000U);
         if (operation_result != OPRT_OK)
         {
@@ -161,14 +171,11 @@ static playback_video_test_result_t playback_video_test_download(
                 playback_video_test_close_http(&session, &response);
                 return PLAYBACK_VIDEO_TEST_NO_MEMORY;
             }
-            if (segment_length > file->length)
-            {
-                segment_length = file->length;
-            }
+            segment_length = file->length;
             PR_NOTICE(
-                "VIDEO: download size=%u segment=%u read=%u",
+                "VIDEO: download size=%u single_request=%u read=%u",
                 (unsigned int)file->length,
-                (unsigned int)PLAYBACK_VIDEO_TEST_SEGMENT_BYTES,
+                (unsigned int)file->length,
                 (unsigned int)PLAYBACK_VIDEO_TEST_READ_BYTES
             );
         }

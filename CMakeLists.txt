@@ -43,6 +43,12 @@ if(TOS_PROJECT_PLATFORM STREQUAL "T5AI")
 endif()
 
 aux_source_directory(${APP_PATH}/src APP_SRC)
+# Playback audio is wired-only. Keep legacy Classic Bluetooth/A2DP sources out
+# of the application archive so they cannot be initialized accidentally.
+list(REMOVE_ITEM APP_SRC
+    ${APP_PATH}/src/playback_bluetooth_browser.c
+    ${APP_PATH}/src/playback_speaker_link.c
+)
 set(APP_INC ${APP_PATH}/include)
 
 set(TINYH264_UPSTREAM_DIR ${APP_PATH}/third_party/tinyh264)

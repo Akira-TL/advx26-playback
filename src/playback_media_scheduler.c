@@ -1,6 +1,6 @@
 /**
  * @file playback_media_scheduler.c
- * @brief PCM-authoritative MP3/H.264 scheduler for the fixed A2DP speaker.
+ * @brief PCM-authoritative MP3/H.264 scheduler for the onboard wired speaker.
  */
 
 #include "playback_media_scheduler.h"
@@ -11,11 +11,36 @@
 #include "playback_h264_decoder.h"
 #include "playback_mp3_audio.h"
 #include "playback_mp4_demux.h"
+#include "playback_wired_speaker.h"
 #include "tal_api.h"
 
 #define PLAYBACK_SCHEDULER_VIDEO_PREROLL_FRAMES (2U)
 #define PLAYBACK_SCHEDULER_MAX_GOP_RECOVERY_FAILURES (2U)
+#define PLAYBACK_SCHEDULER_SPEAKER_QUEUE_TARGET_MS (80U)
+#define PLAYBACK_SCHEDULER_SPEAKER_MAX_WRITES_PER_PUMP \
+    ((PLAYBACK_SCHEDULER_SPEAKER_QUEUE_TARGET_MS + PLAYBACK_WIRED_SPEAKER_WRITE_MS - 1U) / \
+     PLAYBACK_WIRED_SPEAKER_WRITE_MS)
 #define PLAYBACK_SCHEDULER_ANNEX_B_OVERHEAD_BYTES (4U * PLAYBACK_MP4_MAX_NALS_PER_ACCESS_UNIT)
+#define PLAYBACK_SCHEDULER_PERF_LOG_INTERVAL_MS (1000U)
+
+typedef struct
+{
+    uint64_t window_started_ms;
+    uint64_t submitted_start_frames;
+    uint32_t position_start_ms;
+    uint32_t pump_count;
+    uint64_t pump_total_ms;
+    uint32_t pump_max_ms;
+    uint64_t mp3_fill_total_ms;
+    uint32_t mp3_fill_max_ms;
+    uint64_t video_fill_total_ms;
+    uint32_t video_fill_max_ms;
+    uint64_t speaker_total_ms;
+    uint32_t speaker_write_count;
+    uint32_t speaker_write_max_ms;
+    uint64_t present_total_ms;
+    uint32_t present_max_ms;
+} playback_scheduler_perf_window_t;
 
 typedef struct
 {
@@ -28,12 +53,13 @@ typedef struct
     playback_media_package_t package;
     playback_media_scheduler_config_t config;
     MUTEX_HANDLE status_mutex;
+    MUTEX_HANDLE audio_mutex;
 
     playback_mp3_audio_t audio;
     playback_mp4_demux_t demux;
     playback_h264_decoder_t decoder;
     playback_video_output_t video_output;
-    playback_speaker_link_t speaker;
+    playback_wired_speaker_t speaker;
     playback_mp4_codec_config_t codec;
 
     uint8_t *parameter_sets;
@@ -59,7 +85,14 @@ typedef struct
     playback_error_t error;
     uint32_t position_ms;
     bool audio_output_enabled;
+    playback_scheduler_perf_window_t perf;
+
+    THREAD_HANDLE audio_thread;
+    SEM_HANDLE audio_worker_stopped;
+    volatile bool audio_worker_running;
 } playback_media_scheduler_state_t;
+
+static void playback_scheduler_audio_worker(void *context);
 
 static playback_media_scheduler_state_t *playback_scheduler_get_state(
     const playback_media_scheduler_t *scheduler
@@ -102,6 +135,163 @@ static uint32_t playback_scheduler_frames_to_ms(uint64_t frames, uint32_t sample
     return (milliseconds > UINT32_MAX) ? UINT32_MAX : (uint32_t)milliseconds;
 }
 
+static uint64_t playback_scheduler_ms_to_frames(uint32_t milliseconds, uint32_t sample_rate)
+{
+    return ((uint64_t)milliseconds * sample_rate) / 1000ULL;
+}
+
+static uint64_t playback_scheduler_speaker_queued_frames(
+    const playback_wired_speaker_status_t *status
+)
+{
+    if ((status == NULL) ||
+        (status->submitted_pcm_frames <= status->audible_pcm_frames))
+    {
+        return 0ULL;
+    }
+    return status->submitted_pcm_frames - status->audible_pcm_frames;
+}
+
+static uint32_t playback_scheduler_elapsed_ms(uint64_t started_ms)
+{
+    const uint64_t now_ms = tal_system_get_millisecond();
+    const uint64_t elapsed_ms = now_ms >= started_ms ? now_ms - started_ms : 0ULL;
+
+    return elapsed_ms > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed_ms;
+}
+
+static void playback_scheduler_perf_add(
+    uint64_t *total_ms,
+    uint32_t *maximum_ms,
+    uint32_t elapsed_ms
+)
+{
+    *total_ms += elapsed_ms;
+    if (elapsed_ms > *maximum_ms)
+    {
+        *maximum_ms = elapsed_ms;
+    }
+}
+
+static void playback_scheduler_perf_record(
+    playback_media_scheduler_state_t *state,
+    const playback_mp3_status_t *audio_status,
+    const playback_wired_speaker_status_t *speaker_status,
+    uint32_t pump_ms,
+    uint32_t mp3_fill_ms,
+    uint32_t video_fill_ms,
+    uint32_t speaker_ms,
+    uint32_t speaker_write_count,
+    uint32_t speaker_write_max_ms,
+    uint32_t present_ms
+)
+{
+    playback_scheduler_perf_window_t *perf;
+    uint64_t now_ms;
+    uint64_t wall_ms;
+    uint64_t submitted_delta;
+    uint64_t expected_frames;
+    uint64_t queued_frames;
+    uint32_t position_ms;
+    uint32_t position_delta;
+    uint32_t submitted_permille;
+    uint32_t position_permille;
+
+    if ((state == NULL) || (audio_status == NULL) || (speaker_status == NULL) ||
+        (audio_status->sample_rate == 0U))
+    {
+        return;
+    }
+
+    perf = &state->perf;
+    now_ms = tal_system_get_millisecond();
+    position_ms = playback_scheduler_frames_to_ms(
+        speaker_status->audible_pcm_frames,
+        audio_status->sample_rate
+    );
+    if (perf->window_started_ms == 0ULL)
+    {
+        perf->window_started_ms = now_ms;
+        perf->submitted_start_frames = speaker_status->submitted_pcm_frames;
+        perf->position_start_ms = position_ms;
+    }
+
+    perf->pump_count++;
+    playback_scheduler_perf_add(&perf->pump_total_ms, &perf->pump_max_ms, pump_ms);
+    playback_scheduler_perf_add(
+        &perf->mp3_fill_total_ms,
+        &perf->mp3_fill_max_ms,
+        mp3_fill_ms
+    );
+    playback_scheduler_perf_add(
+        &perf->video_fill_total_ms,
+        &perf->video_fill_max_ms,
+        video_fill_ms
+    );
+    perf->speaker_total_ms += speaker_ms;
+    perf->speaker_write_count += speaker_write_count;
+    if (speaker_write_max_ms > perf->speaker_write_max_ms)
+    {
+        perf->speaker_write_max_ms = speaker_write_max_ms;
+    }
+    playback_scheduler_perf_add(
+        &perf->present_total_ms,
+        &perf->present_max_ms,
+        present_ms
+    );
+
+    wall_ms = now_ms >= perf->window_started_ms
+                  ? now_ms - perf->window_started_ms
+                  : 0ULL;
+    if (wall_ms < PLAYBACK_SCHEDULER_PERF_LOG_INTERVAL_MS)
+    {
+        return;
+    }
+
+    submitted_delta = speaker_status->submitted_pcm_frames >= perf->submitted_start_frames
+                          ? speaker_status->submitted_pcm_frames - perf->submitted_start_frames
+                          : 0ULL;
+    expected_frames = ((uint64_t)audio_status->sample_rate * wall_ms) / 1000ULL;
+    submitted_permille = expected_frames > 0ULL
+                             ? (uint32_t)((submitted_delta * 1000ULL) / expected_frames)
+                             : 0U;
+    position_delta = position_ms >= perf->position_start_ms
+                         ? position_ms - perf->position_start_ms
+                         : 0U;
+    position_permille = wall_ms > 0ULL
+                            ? (uint32_t)(((uint64_t)position_delta * 1000ULL) / wall_ms)
+                            : 0U;
+    queued_frames = playback_scheduler_speaker_queued_frames(speaker_status);
+
+    PR_NOTICE(
+        "[DEBUG-avperf] scheduler wall=%llu pumps=%u pump_total=%llu pump_max=%u mp3_total=%llu mp3_max=%u video_total=%llu video_max=%u speaker_total=%llu writes=%u write_max=%u present_total=%llu present_max=%u submitted=%llu expected=%llu submit_permille=%u position_delta=%u position_permille=%u queue_frames=%llu",
+        (unsigned long long)wall_ms,
+        (unsigned int)perf->pump_count,
+        (unsigned long long)perf->pump_total_ms,
+        (unsigned int)perf->pump_max_ms,
+        (unsigned long long)perf->mp3_fill_total_ms,
+        (unsigned int)perf->mp3_fill_max_ms,
+        (unsigned long long)perf->video_fill_total_ms,
+        (unsigned int)perf->video_fill_max_ms,
+        (unsigned long long)perf->speaker_total_ms,
+        (unsigned int)perf->speaker_write_count,
+        (unsigned int)perf->speaker_write_max_ms,
+        (unsigned long long)perf->present_total_ms,
+        (unsigned int)perf->present_max_ms,
+        (unsigned long long)submitted_delta,
+        (unsigned long long)expected_frames,
+        (unsigned int)submitted_permille,
+        (unsigned int)position_delta,
+        (unsigned int)position_permille,
+        (unsigned long long)queued_frames
+    );
+
+    memset(perf, 0, sizeof(*perf));
+    perf->window_started_ms = now_ms;
+    perf->submitted_start_frames = speaker_status->submitted_pcm_frames;
+    perf->position_start_ms = position_ms;
+}
+
 static void playback_scheduler_set_runtime(
     playback_media_scheduler_state_t *state,
     playback_state_t playback_state,
@@ -120,10 +310,11 @@ static playback_media_scheduler_result_t playback_scheduler_fail(
     playback_error_t error
 )
 {
-    playback_scheduler_set_runtime(state, PLAYBACK_STATE_ERROR, error);
-    (void)playback_mp3_audio_pause(&state->audio, PLAYBACK_MP3_PAUSE_OUTPUT);
-    state->audio_output_enabled = false;
-    (void)playback_speaker_link_stop(&state->speaker);
+    tal_mutex_lock(state->status_mutex);
+    state->state = PLAYBACK_STATE_ERROR;
+    state->intent = PLAYBACK_INTENT_PAUSED;
+    state->error = error;
+    tal_mutex_unlock(state->status_mutex);
     return result;
 }
 
@@ -269,6 +460,7 @@ static playback_media_scheduler_result_t playback_scheduler_recover_h264(
     playback_h264_result_t reset_result;
     uint64_t maximum_gap_ticks;
     uint32_t sample_index;
+    uint32_t position_ms;
 
     if (!playback_scheduler_h264_recoverable(failure))
     {
@@ -340,8 +532,11 @@ static playback_media_scheduler_result_t playback_scheduler_recover_h264(
         state->next_video_sample = sync_sample.index;
         state->video_exhausted = false;
         state->seeking = true;
+        tal_mutex_lock(state->status_mutex);
+        position_ms = state->position_ms;
+        tal_mutex_unlock(state->status_mutex);
         state->seek_target_ticks =
-            ((uint64_t)state->position_ms * state->codec.timescale) / 1000ULL;
+            ((uint64_t)position_ms * state->codec.timescale) / 1000ULL;
         state->h264_recovery_active = true;
         return PLAYBACK_SCHEDULER_OK;
     }
@@ -499,10 +694,10 @@ static playback_media_scheduler_result_t playback_scheduler_present_due(
     uint32_t media_position_ms
 )
 {
-    uint64_t adjusted = (uint64_t)media_position_ms + state->config.speaker_latency_ms;
-    uint32_t presentation_clock = (adjusted > state->package.session.duration_ms)
-                                      ? state->package.session.duration_ms
-                                      : (uint32_t)adjusted;
+    const uint32_t presentation_clock =
+        (media_position_ms > state->package.session.duration_ms)
+            ? state->package.session.duration_ms
+            : media_position_ms;
     uint8_t due = playback_scheduler_due_video_count(state, presentation_clock);
 
     while (due > 1U)
@@ -568,12 +763,6 @@ static bool playback_scheduler_audio_ready(const playback_mp3_status_t *audio)
            (audio->consumed_pcm_frames >= audio->expected_pcm_frames);
 }
 
-static bool playback_scheduler_video_ready(const playback_media_scheduler_state_t *state)
-{
-    return (state->video_count >= PLAYBACK_SCHEDULER_VIDEO_PREROLL_FRAMES) ||
-           (state->video_exhausted && (state->video_count > 0U));
-}
-
 static void playback_scheduler_release_state(playback_media_scheduler_state_t *state)
 {
     uint8_t index;
@@ -583,7 +772,7 @@ static void playback_scheduler_release_state(playback_media_scheduler_state_t *s
         return;
     }
 
-    playback_speaker_link_close(&state->speaker);
+    playback_wired_speaker_close(&state->speaker);
     playback_video_output_close(&state->video_output);
     playback_h264_decoder_close(&state->decoder);
     playback_mp4_demux_close(&state->demux);
@@ -604,6 +793,14 @@ static void playback_scheduler_release_state(playback_media_scheduler_state_t *s
     {
         tal_psram_free(state->parameter_sets);
     }
+    if (state->audio_worker_stopped != NULL)
+    {
+        tal_semaphore_release(state->audio_worker_stopped);
+    }
+    if (state->audio_mutex != NULL)
+    {
+        tal_mutex_release(state->audio_mutex);
+    }
     if (state->status_mutex != NULL)
     {
         tal_mutex_release(state->status_mutex);
@@ -620,12 +817,12 @@ playback_media_scheduler_result_t playback_media_scheduler_prepare(
 {
     playback_media_scheduler_state_t *state;
     playback_media_package_t validated_package;
-    playback_speaker_link_config_t speaker_config;
+    playback_wired_speaker_config_t speaker_config;
     playback_mp4_result_t mp4_result;
     playback_h264_result_t h264_result;
     playback_mp3_result_t mp3_result;
     playback_video_output_result_t output_result;
-    playback_speaker_link_result_t speaker_result;
+    playback_wired_speaker_result_t speaker_result;
     playback_package_result_t package_result;
     size_t parameter_sets_length = 0U;
     size_t y_length;
@@ -655,27 +852,38 @@ playback_media_scheduler_result_t playback_media_scheduler_prepare(
     }
     state->package = validated_package;
     state->config = *config;
-    if (state->config.speaker_latency_ms == 0U)
-    {
-        state->config.speaker_latency_ms = PLAYBACK_SCHEDULER_DEFAULT_SPEAKER_LATENCY_MS;
-    }
     state->state = PLAYBACK_STATE_LOADING;
     state->intent = package->session.autoplay ? PLAYBACK_INTENT_PLAYING : PLAYBACK_INTENT_PAUSED;
     state->error = PLAYBACK_ERROR_NONE;
 
-    if (tal_mutex_create_init(&state->status_mutex) != OPRT_OK)
+    if ((tal_mutex_create_init(&state->status_mutex) != OPRT_OK) ||
+        (tal_mutex_create_init(&state->audio_mutex) != OPRT_OK))
     {
         playback_scheduler_release_state(state);
         return PLAYBACK_SCHEDULER_NO_MEMORY;
     }
 
-    mp3_result = playback_mp3_audio_prepare(
-        &state->audio,
-        &state->package.session.audio,
-        audio_index,
-        state->package.session.duration_ms,
-        &state->config.http
-    );
+    if (state->config.audio_memory != NULL)
+    {
+        mp3_result = playback_mp3_audio_prepare_memory(
+            &state->audio,
+            &state->package.session.audio,
+            audio_index,
+            state->package.session.duration_ms,
+            state->config.audio_memory,
+            state->config.audio_memory_length
+        );
+    }
+    else
+    {
+        mp3_result = playback_mp3_audio_prepare(
+            &state->audio,
+            &state->package.session.audio,
+            audio_index,
+            state->package.session.duration_ms,
+            &state->config.http
+        );
+    }
     if (mp3_result != PLAYBACK_MP3_OK)
     {
         playback_scheduler_release_state(state);
@@ -683,11 +891,22 @@ playback_media_scheduler_result_t playback_media_scheduler_prepare(
     }
     (void)playback_mp3_audio_pause(&state->audio, PLAYBACK_MP3_PAUSE_OUTPUT);
 
-    mp4_result = playback_mp4_demux_open(
-        &state->demux,
-        &state->package.session.video.asset,
-        &state->config.http
-    );
+    if (state->config.video_memory != NULL)
+    {
+        mp4_result = playback_mp4_demux_open_memory(
+            &state->demux,
+            state->config.video_memory,
+            state->config.video_memory_length
+        );
+    }
+    else
+    {
+        mp4_result = playback_mp4_demux_open(
+            &state->demux,
+            &state->package.session.video.asset,
+            &state->config.http
+        );
+    }
     if (mp4_result != PLAYBACK_MP4_OK)
     {
         playback_scheduler_release_state(state);
@@ -787,24 +1006,51 @@ playback_media_scheduler_result_t playback_media_scheduler_prepare(
         return PLAYBACK_SCHEDULER_OUTPUT_FAILED;
     }
 
-    memset(&speaker_config, 0, sizeof(speaker_config));
-    memcpy(
-        speaker_config.target_address,
-        state->config.speaker_address,
-        sizeof(speaker_config.target_address)
-    );
+    speaker_config = state->config.wired_speaker;
     speaker_config.sample_rate = state->package.session.audio.sample_rate;
-    speaker_config.channels = state->package.session.audio.channels;
+    speaker_config.source_channels = state->package.session.audio.channels;
     speaker_config.read_pcm = playback_scheduler_read_pcm;
     speaker_config.context = state;
-    speaker_result = playback_speaker_link_init(&state->speaker, &speaker_config);
-    if (speaker_result != PLAYBACK_SPEAKER_LINK_OK)
+    speaker_result = playback_wired_speaker_open(&state->speaker, &speaker_config);
+    if (speaker_result != PLAYBACK_WIRED_SPEAKER_OK)
     {
         playback_scheduler_release_state(state);
         return PLAYBACK_SCHEDULER_SPEAKER_FAILED;
     }
 
     state->audio_output_enabled = false;
+    state->audio_worker_running = false;
+
+    if (tal_semaphore_create_init(&state->audio_worker_stopped, 0U, 1U) != OPRT_OK)
+    {
+        playback_scheduler_release_state(state);
+        return PLAYBACK_SCHEDULER_NO_MEMORY;
+    }
+
+    {
+        THREAD_CFG_T audio_thread_config;
+        memset(&audio_thread_config, 0, sizeof(audio_thread_config));
+        audio_thread_config.stackDepth = (8U * 1024U);
+        audio_thread_config.priority = THREAD_PRIO_1;
+        audio_thread_config.thrdname = "playback_audio";
+        audio_thread_config.psram_mode = 1U;
+
+        state->audio_worker_running = true;
+        if (tal_thread_create_and_start(
+                &state->audio_thread,
+                NULL,
+                NULL,
+                playback_scheduler_audio_worker,
+                state,
+                &audio_thread_config
+            ) != OPRT_OK)
+        {
+            state->audio_worker_running = false;
+            playback_scheduler_release_state(state);
+            return PLAYBACK_SCHEDULER_SPEAKER_FAILED;
+        }
+    }
+
     state->state = package->session.autoplay ? PLAYBACK_STATE_BUFFERING : PLAYBACK_STATE_PAUSED;
     scheduler->state = state;
     return PLAYBACK_SCHEDULER_OK;
@@ -815,16 +1061,21 @@ playback_media_scheduler_result_t playback_media_scheduler_play(
 )
 {
     playback_media_scheduler_state_t *state = playback_scheduler_get_state(scheduler);
+    playback_state_t current_state;
 
     if (state == NULL)
     {
         return PLAYBACK_SCHEDULER_NOT_PREPARED;
     }
-    if (state->state == PLAYBACK_STATE_ERROR)
+
+    tal_mutex_lock(state->status_mutex);
+    current_state = state->state;
+    tal_mutex_unlock(state->status_mutex);
+    if (current_state == PLAYBACK_STATE_ERROR)
     {
         return PLAYBACK_SCHEDULER_ERROR_STATE;
     }
-    if (state->state == PLAYBACK_STATE_COMPLETED)
+    if (current_state == PLAYBACK_STATE_COMPLETED)
     {
         playback_media_scheduler_result_t seek_result = playback_media_scheduler_seek(scheduler, 0U);
         if (seek_result != PLAYBACK_SCHEDULER_OK)
@@ -837,8 +1088,10 @@ playback_media_scheduler_result_t playback_media_scheduler_play(
     state->intent = PLAYBACK_INTENT_PLAYING;
     state->state = PLAYBACK_STATE_BUFFERING;
     tal_mutex_unlock(state->status_mutex);
+
+    tal_mutex_lock(state->audio_mutex);
     (void)playback_mp3_audio_resume(&state->audio, PLAYBACK_MP3_PAUSE_FETCH);
-    (void)playback_speaker_link_start(&state->speaker);
+    tal_mutex_unlock(state->audio_mutex);
     return PLAYBACK_SCHEDULER_OK;
 }
 
@@ -847,22 +1100,39 @@ playback_media_scheduler_result_t playback_media_scheduler_pause(
 )
 {
     playback_media_scheduler_state_t *state = playback_scheduler_get_state(scheduler);
+    playback_state_t current_state;
+    playback_wired_speaker_result_t speaker_result;
 
     if (state == NULL)
     {
         return PLAYBACK_SCHEDULER_NOT_PREPARED;
     }
-    if (state->state == PLAYBACK_STATE_ERROR)
+
+    tal_mutex_lock(state->status_mutex);
+    current_state = state->state;
+    if (current_state != PLAYBACK_STATE_ERROR)
+    {
+        state->intent = PLAYBACK_INTENT_PAUSED;
+        state->state = PLAYBACK_STATE_PAUSED;
+    }
+    tal_mutex_unlock(state->status_mutex);
+    if (current_state == PLAYBACK_STATE_ERROR)
     {
         return PLAYBACK_SCHEDULER_ERROR_STATE;
     }
 
-    tal_mutex_lock(state->status_mutex);
-    state->intent = PLAYBACK_INTENT_PAUSED;
-    state->state = PLAYBACK_STATE_PAUSED;
-    tal_mutex_unlock(state->status_mutex);
+    tal_mutex_lock(state->audio_mutex);
     playback_scheduler_set_audio_output(state, false);
-    (void)playback_speaker_link_stop(&state->speaker);
+    speaker_result = playback_wired_speaker_pause(&state->speaker);
+    tal_mutex_unlock(state->audio_mutex);
+    if (speaker_result != PLAYBACK_WIRED_SPEAKER_OK)
+    {
+        return playback_scheduler_fail(
+            state,
+            PLAYBACK_SCHEDULER_SPEAKER_FAILED,
+            PLAYBACK_ERROR_INTERNAL
+        );
+    }
     return PLAYBACK_SCHEDULER_OK;
 }
 
@@ -886,20 +1156,35 @@ playback_media_scheduler_result_t playback_media_scheduler_seek(
     {
         return PLAYBACK_SCHEDULER_INVALID_ARGUMENT;
     }
+    tal_mutex_lock(state->status_mutex);
     if (state->state == PLAYBACK_STATE_ERROR)
     {
+        tal_mutex_unlock(state->status_mutex);
         return PLAYBACK_SCHEDULER_ERROR_STATE;
     }
+    state->state = PLAYBACK_STATE_SEEKING;
+    state->error = PLAYBACK_ERROR_NONE;
+    tal_mutex_unlock(state->status_mutex);
 
-    playback_scheduler_set_runtime(state, PLAYBACK_STATE_SEEKING, PLAYBACK_ERROR_NONE);
+    tal_mutex_lock(state->audio_mutex);
     playback_scheduler_set_audio_output(state, false);
-    (void)playback_speaker_link_stop(&state->speaker);
     (void)playback_mp3_audio_pause(&state->audio, PLAYBACK_MP3_PAUSE_FETCH);
 
     target_pcm_frame = ((uint64_t)position_ms * state->package.session.audio.sample_rate) / 1000ULL;
+    if (playback_wired_speaker_reset(&state->speaker, target_pcm_frame) !=
+        PLAYBACK_WIRED_SPEAKER_OK)
+    {
+        tal_mutex_unlock(state->audio_mutex);
+        return playback_scheduler_fail(
+            state,
+            PLAYBACK_SCHEDULER_SPEAKER_FAILED,
+            PLAYBACK_ERROR_INTERNAL
+        );
+    }
     mp3_result = playback_mp3_audio_seek(&state->audio, target_pcm_frame);
     if (mp3_result != PLAYBACK_MP3_OK)
     {
+        tal_mutex_unlock(state->audio_mutex);
         return playback_scheduler_fail(
             state,
             PLAYBACK_SCHEDULER_AUDIO_FAILED,
@@ -910,6 +1195,7 @@ playback_media_scheduler_result_t playback_media_scheduler_seek(
     mp4_result = playback_mp4_demux_find_sync_at_or_before(&state->demux, position_ms, &sync_sample);
     if (mp4_result != PLAYBACK_MP4_OK)
     {
+        tal_mutex_unlock(state->audio_mutex);
         return playback_scheduler_fail(
             state,
             PLAYBACK_SCHEDULER_VIDEO_FAILED,
@@ -919,6 +1205,7 @@ playback_media_scheduler_result_t playback_media_scheduler_seek(
     h264_result = playback_h264_decoder_reset_at_sync(&state->decoder);
     if (h264_result != PLAYBACK_H264_OK)
     {
+        tal_mutex_unlock(state->audio_mutex);
         return playback_scheduler_fail(
             state,
             PLAYBACK_SCHEDULER_VIDEO_FAILED,
@@ -933,14 +1220,15 @@ playback_media_scheduler_result_t playback_media_scheduler_seek(
     state->video_exhausted = false;
     state->seeking = true;
     state->seek_target_ticks = ((uint64_t)position_ms * state->codec.timescale) / 1000ULL;
-    state->position_ms = position_ms;
     (void)playback_mp3_audio_resume(&state->audio, PLAYBACK_MP3_PAUSE_FETCH);
 
     tal_mutex_lock(state->status_mutex);
+    state->position_ms = position_ms;
     state->state = (state->intent == PLAYBACK_INTENT_PLAYING)
                        ? PLAYBACK_STATE_BUFFERING
                        : PLAYBACK_STATE_PAUSED;
     tal_mutex_unlock(state->status_mutex);
+    tal_mutex_unlock(state->audio_mutex);
     return PLAYBACK_SCHEDULER_OK;
 }
 
@@ -969,137 +1257,433 @@ playback_media_scheduler_result_t playback_media_scheduler_stop(
     return PLAYBACK_SCHEDULER_OK;
 }
 
+/* --- audio worker (high-priority thread) ---------------------------------- */
+
+static void playback_scheduler_audio_pump_locked(playback_media_scheduler_state_t *state)
+{
+    playback_mp3_status_t audio_status;
+    playback_wired_speaker_status_t speaker_status;
+    playback_mp3_result_t mp3_result;
+    playback_wired_speaker_result_t speaker_result;
+    playback_intent_t intent;
+    playback_state_t current_state;
+    bool audio_submitted_complete;
+    bool audio_audible_complete;
+    uint64_t pump_started_ms = tal_system_get_millisecond();
+    uint64_t phase_started_ms;
+    uint32_t mp3_fill_ms = 0U;
+    uint32_t speaker_ms = 0U;
+    uint32_t speaker_write_count = 0U;
+    uint32_t speaker_write_max_ms = 0U;
+    uint32_t position_ms;
+
+    tal_mutex_lock(state->status_mutex);
+    current_state = state->state;
+    intent = state->intent;
+    tal_mutex_unlock(state->status_mutex);
+
+    if ((current_state == PLAYBACK_STATE_ERROR) ||
+        (current_state == PLAYBACK_STATE_COMPLETED) ||
+        (current_state == PLAYBACK_STATE_LOADING) ||
+        (current_state == PLAYBACK_STATE_SEEKING))
+    {
+        playback_scheduler_set_audio_output(state, false);
+        (void)playback_wired_speaker_pause(&state->speaker);
+        return;
+    }
+
+    /* -- MP3 fill -------------------------------------------------------- */
+    if (playback_mp3_audio_get_status(&state->audio, &audio_status) != PLAYBACK_MP3_OK)
+    {
+        playback_scheduler_fail(state, PLAYBACK_SCHEDULER_AUDIO_FAILED, PLAYBACK_ERROR_INTERNAL);
+        return;
+    }
+    if (!audio_status.fetch_paused &&
+        (audio_status.available_pcm_frames < audio_status.high_water_frames) &&
+        !audio_status.source_exhausted)
+    {
+        phase_started_ms = tal_system_get_millisecond();
+        mp3_result = playback_mp3_audio_fill(&state->audio);
+        mp3_fill_ms += playback_scheduler_elapsed_ms(phase_started_ms);
+        if ((mp3_result != PLAYBACK_MP3_OK) && (mp3_result != PLAYBACK_MP3_END_OF_STREAM) &&
+            (mp3_result != PLAYBACK_MP3_BUFFER_FULL))
+        {
+            playback_scheduler_fail(
+                state,
+                PLAYBACK_SCHEDULER_AUDIO_FAILED,
+                playback_mp3_result_to_error(mp3_result)
+            );
+            return;
+        }
+    }
+
+    /* -- Status and position -------------------------------------------- */
+    if ((playback_mp3_audio_get_status(&state->audio, &audio_status) != PLAYBACK_MP3_OK) ||
+        (playback_wired_speaker_get_status(&state->speaker, &speaker_status) !=
+         PLAYBACK_WIRED_SPEAKER_OK))
+    {
+        playback_scheduler_fail(state, PLAYBACK_SCHEDULER_SPEAKER_FAILED, PLAYBACK_ERROR_INTERNAL);
+        return;
+    }
+
+    position_ms = playback_scheduler_frames_to_ms(
+        speaker_status.audible_pcm_frames,
+        audio_status.sample_rate
+    );
+    if (position_ms > state->package.session.duration_ms)
+    {
+        position_ms = state->package.session.duration_ms;
+    }
+    tal_mutex_lock(state->status_mutex);
+    state->position_ms = position_ms;
+    tal_mutex_unlock(state->status_mutex);
+
+    /* -- Pause ---------------------------------------------------------- */
+    if (intent == PLAYBACK_INTENT_PAUSED)
+    {
+        playback_scheduler_set_audio_output(state, false);
+        (void)playback_wired_speaker_pause(&state->speaker);
+        playback_scheduler_set_runtime(state, PLAYBACK_STATE_PAUSED, PLAYBACK_ERROR_NONE);
+        return;
+    }
+
+    /* -- Buffering (audio only, no video gate) -------------------------- */
+    audio_submitted_complete = audio_status.source_exhausted &&
+                               (audio_status.consumed_pcm_frames >=
+                                audio_status.expected_pcm_frames);
+
+    if (!audio_submitted_complete &&
+        !playback_scheduler_audio_ready(&audio_status))
+    {
+        playback_scheduler_set_audio_output(state, false);
+        (void)playback_wired_speaker_pause(&state->speaker);
+        playback_scheduler_set_runtime(state, PLAYBACK_STATE_BUFFERING, PLAYBACK_ERROR_NONE);
+        return;
+    }
+
+    /* -- Speaker start -------------------------------------------------- */
+    speaker_result = playback_wired_speaker_start(&state->speaker);
+    if (speaker_result != PLAYBACK_WIRED_SPEAKER_OK)
+    {
+        playback_scheduler_fail(
+            state,
+            PLAYBACK_SCHEDULER_SPEAKER_FAILED,
+            PLAYBACK_ERROR_INTERNAL
+        );
+        return;
+    }
+
+    /* -- Speaker pump --------------------------------------------------- */
+    if (!audio_submitted_complete)
+    {
+        const uint64_t target_queued_frames = playback_scheduler_ms_to_frames(
+            PLAYBACK_SCHEDULER_SPEAKER_QUEUE_TARGET_MS,
+            audio_status.sample_rate
+        );
+        uint8_t writes = 0U;
+
+        playback_scheduler_set_audio_output(state, true);
+        while ((writes < PLAYBACK_SCHEDULER_SPEAKER_MAX_WRITES_PER_PUMP) &&
+               (playback_scheduler_speaker_queued_frames(&speaker_status) <
+                target_queued_frames))
+        {
+            uint32_t write_ms;
+
+            phase_started_ms = tal_system_get_millisecond();
+            speaker_result = playback_wired_speaker_pump(&state->speaker);
+            write_ms = playback_scheduler_elapsed_ms(phase_started_ms);
+            speaker_ms += write_ms;
+            speaker_write_count++;
+            if (write_ms > speaker_write_max_ms)
+            {
+                speaker_write_max_ms = write_ms;
+            }
+            if ((speaker_result != PLAYBACK_WIRED_SPEAKER_OK) &&
+                (speaker_result != PLAYBACK_WIRED_SPEAKER_NO_DATA))
+            {
+                playback_scheduler_fail(
+                    state,
+                    PLAYBACK_SCHEDULER_SPEAKER_FAILED,
+                    PLAYBACK_ERROR_INTERNAL
+                );
+                return;
+            }
+            if ((playback_mp3_audio_get_status(&state->audio, &audio_status) !=
+                 PLAYBACK_MP3_OK) ||
+                (playback_wired_speaker_get_status(&state->speaker, &speaker_status) !=
+                 PLAYBACK_WIRED_SPEAKER_OK))
+            {
+                playback_scheduler_fail(
+                    state,
+                    PLAYBACK_SCHEDULER_SPEAKER_FAILED,
+                    PLAYBACK_ERROR_INTERNAL
+                );
+                return;
+            }
+            if (speaker_result == PLAYBACK_WIRED_SPEAKER_NO_DATA)
+            {
+                if (playback_scheduler_speaker_queued_frames(&speaker_status) == 0ULL)
+                {
+                    playback_scheduler_set_audio_output(state, false);
+                    (void)playback_wired_speaker_pause(&state->speaker);
+                    playback_scheduler_set_runtime(
+                        state,
+                        PLAYBACK_STATE_BUFFERING,
+                        PLAYBACK_ERROR_NONE
+                    );
+                    return;
+                }
+                break;
+            }
+
+            writes++;
+            audio_submitted_complete = audio_status.source_exhausted &&
+                                       (audio_status.consumed_pcm_frames >=
+                                        audio_status.expected_pcm_frames);
+            if (audio_submitted_complete)
+            {
+                break;
+            }
+        }
+    }
+    else
+    {
+        playback_scheduler_set_audio_output(state, false);
+    }
+
+    /* -- Position update after pump ------------------------------------- */
+    if ((playback_mp3_audio_get_status(&state->audio, &audio_status) != PLAYBACK_MP3_OK) ||
+        (playback_wired_speaker_get_status(&state->speaker, &speaker_status) !=
+         PLAYBACK_WIRED_SPEAKER_OK))
+    {
+        playback_scheduler_fail(state, PLAYBACK_SCHEDULER_SPEAKER_FAILED, PLAYBACK_ERROR_INTERNAL);
+        return;
+    }
+
+    position_ms = playback_scheduler_frames_to_ms(
+        speaker_status.audible_pcm_frames,
+        audio_status.sample_rate
+    );
+    if (position_ms > state->package.session.duration_ms)
+    {
+        position_ms = state->package.session.duration_ms;
+    }
+    tal_mutex_lock(state->status_mutex);
+    state->position_ms = position_ms;
+    tal_mutex_unlock(state->status_mutex);
+
+    /* -- Completion ----------------------------------------------------- */
+    audio_submitted_complete = audio_status.source_exhausted &&
+                               (audio_status.consumed_pcm_frames >=
+                                audio_status.expected_pcm_frames);
+    audio_audible_complete = audio_submitted_complete &&
+                             (speaker_status.audible_pcm_frames >=
+                              audio_status.expected_pcm_frames);
+    if (audio_audible_complete)
+    {
+        playback_scheduler_set_audio_output(state, false);
+        (void)playback_wired_speaker_pause(&state->speaker);
+        /* The video pump owns final draining and the COMPLETED transition. */
+        playback_scheduler_perf_record(
+            state,
+            &audio_status,
+            &speaker_status,
+            playback_scheduler_elapsed_ms(pump_started_ms),
+            mp3_fill_ms,
+            0U,
+            speaker_ms,
+            speaker_write_count,
+            speaker_write_max_ms,
+            0U
+        );
+        return;
+    }
+
+    playback_scheduler_set_runtime(state, PLAYBACK_STATE_PLAYING, PLAYBACK_ERROR_NONE);
+    playback_scheduler_perf_record(
+        state,
+        &audio_status,
+        &speaker_status,
+        playback_scheduler_elapsed_ms(pump_started_ms),
+        mp3_fill_ms,
+        0U,
+        speaker_ms,
+        speaker_write_count,
+        speaker_write_max_ms,
+        0U
+    );
+}
+
+static void playback_scheduler_audio_pump(playback_media_scheduler_state_t *state)
+{
+    tal_mutex_lock(state->audio_mutex);
+    playback_scheduler_audio_pump_locked(state);
+    tal_mutex_unlock(state->audio_mutex);
+}
+
+static void playback_scheduler_audio_worker(void *context)
+{
+    playback_media_scheduler_state_t *state = context;
+
+    while (state->audio_worker_running)
+    {
+        playback_scheduler_audio_pump(state);
+        tal_system_sleep(5);
+    }
+
+    tal_semaphore_post(state->audio_worker_stopped);
+}
+
+/* --- video pump (caller thread) ------------------------------------------ */
+
 playback_media_scheduler_result_t playback_media_scheduler_pump(
     playback_media_scheduler_t *scheduler
 )
 {
     playback_media_scheduler_state_t *state = playback_scheduler_get_state(scheduler);
-    playback_mp3_status_t audio_status;
-    playback_speaker_link_status_t speaker_status;
-    playback_mp3_result_t mp3_result;
     playback_media_scheduler_result_t result;
     playback_intent_t intent;
-    bool audio_complete;
+    playback_state_t current_state;
+    uint64_t pump_started_ms;
+    uint64_t phase_started_ms;
+    uint32_t video_fill_ms = 0U;
+    uint32_t present_ms = 0U;
+    uint32_t position_ms;
 
     if (state == NULL)
     {
         return PLAYBACK_SCHEDULER_NOT_PREPARED;
     }
 
+    pump_started_ms = tal_system_get_millisecond();
+
     tal_mutex_lock(state->status_mutex);
-    if (state->state == PLAYBACK_STATE_ERROR)
-    {
-        tal_mutex_unlock(state->status_mutex);
-        return PLAYBACK_SCHEDULER_ERROR_STATE;
-    }
+    current_state = state->state;
     intent = state->intent;
     tal_mutex_unlock(state->status_mutex);
 
-    if (playback_mp3_audio_get_status(&state->audio, &audio_status) != PLAYBACK_MP3_OK)
+    if (current_state == PLAYBACK_STATE_ERROR)
     {
-        return playback_scheduler_fail(state, PLAYBACK_SCHEDULER_AUDIO_FAILED, PLAYBACK_ERROR_INTERNAL);
-    }
-    if (!audio_status.fetch_paused &&
-        (audio_status.available_pcm_frames < audio_status.high_water_frames) &&
-        !audio_status.source_exhausted)
-    {
-        mp3_result = playback_mp3_audio_fill(&state->audio);
-        if ((mp3_result != PLAYBACK_MP3_OK) && (mp3_result != PLAYBACK_MP3_END_OF_STREAM) &&
-            (mp3_result != PLAYBACK_MP3_BUFFER_FULL))
-        {
-            return playback_scheduler_fail(
-                state,
-                PLAYBACK_SCHEDULER_AUDIO_FAILED,
-                playback_mp3_result_to_error(mp3_result)
-            );
-        }
+        return PLAYBACK_SCHEDULER_ERROR_STATE;
     }
 
+    if (intent == PLAYBACK_INTENT_PAUSED)
+    {
+        return PLAYBACK_SCHEDULER_OK;
+    }
+
+    /* -- Video decode --------------------------------------------------- */
+    phase_started_ms = tal_system_get_millisecond();
     result = playback_scheduler_fill_video(state);
+    video_fill_ms = playback_scheduler_elapsed_ms(phase_started_ms);
     if (result != PLAYBACK_SCHEDULER_OK)
     {
         return result;
     }
-    if (playback_mp3_audio_get_status(&state->audio, &audio_status) != PLAYBACK_MP3_OK)
-    {
-        return playback_scheduler_fail(state, PLAYBACK_SCHEDULER_AUDIO_FAILED, PLAYBACK_ERROR_INTERNAL);
-    }
-    if (playback_speaker_link_get_status(&state->speaker, &speaker_status) != PLAYBACK_SPEAKER_LINK_OK)
-    {
-        return playback_scheduler_fail(state, PLAYBACK_SCHEDULER_SPEAKER_FAILED, PLAYBACK_ERROR_INTERNAL);
-    }
 
-    state->position_ms = playback_scheduler_frames_to_ms(
-        audio_status.consumed_pcm_frames,
-        audio_status.sample_rate
-    );
-    if (state->position_ms > state->package.session.duration_ms)
+    /* -- Present -------------------------------------------------------- */
+    tal_mutex_lock(state->status_mutex);
+    position_ms = state->position_ms;
+    tal_mutex_unlock(state->status_mutex);
+    phase_started_ms = tal_system_get_millisecond();
+    result = playback_scheduler_present_due(state, position_ms);
+    present_ms = playback_scheduler_elapsed_ms(phase_started_ms);
+    if (result != PLAYBACK_SCHEDULER_OK)
     {
-        state->position_ms = state->package.session.duration_ms;
+        return result;
     }
 
-    audio_complete = audio_status.source_exhausted &&
-                     (audio_status.consumed_pcm_frames >= audio_status.expected_pcm_frames);
-
-    if (intent == PLAYBACK_INTENT_PAUSED)
+    /* -- Completion: audio done, drain remaining video ------------------ */
     {
-        playback_scheduler_set_audio_output(state, false);
-        if (speaker_status.desired_streaming)
+        playback_mp3_status_t audio_status;
+        playback_wired_speaker_status_t speaker_status;
+        bool audio_submitted_complete;
+        bool audio_audible_complete;
+
+        tal_mutex_lock(state->audio_mutex);
+        if ((playback_mp3_audio_get_status(&state->audio, &audio_status) != PLAYBACK_MP3_OK) ||
+            (playback_wired_speaker_get_status(&state->speaker, &speaker_status) !=
+             PLAYBACK_WIRED_SPEAKER_OK))
         {
-            (void)playback_speaker_link_stop(&state->speaker);
+            tal_mutex_unlock(state->audio_mutex);
+            return playback_scheduler_fail(
+                state,
+                PLAYBACK_SCHEDULER_SPEAKER_FAILED,
+                PLAYBACK_ERROR_INTERNAL
+            );
         }
-        playback_scheduler_set_runtime(state, PLAYBACK_STATE_PAUSED, PLAYBACK_ERROR_NONE);
-        return PLAYBACK_SCHEDULER_OK;
-    }
+        tal_mutex_unlock(state->audio_mutex);
 
-    if (audio_complete)
-    {
-        playback_scheduler_set_audio_output(state, false);
-        if (speaker_status.desired_streaming)
+        audio_submitted_complete = audio_status.source_exhausted &&
+                                   (audio_status.consumed_pcm_frames >=
+                                    audio_status.expected_pcm_frames);
+        audio_audible_complete = audio_submitted_complete &&
+                                 (speaker_status.audible_pcm_frames >=
+                                  audio_status.expected_pcm_frames);
+        if (audio_audible_complete)
         {
-            (void)playback_speaker_link_stop(&state->speaker);
+            phase_started_ms = tal_system_get_millisecond();
+            result = playback_scheduler_present_due(
+                state,
+                state->package.session.duration_ms
+            );
+            present_ms += playback_scheduler_elapsed_ms(phase_started_ms);
+            if (result != PLAYBACK_SCHEDULER_OK)
+            {
+                return result;
+            }
+            playback_scheduler_set_runtime(
+                state,
+                (state->video_exhausted && (state->video_count == 0U))
+                    ? PLAYBACK_STATE_COMPLETED
+                    : PLAYBACK_STATE_BUFFERING,
+                PLAYBACK_ERROR_NONE
+            );
         }
-        result = playback_scheduler_present_due(state, state->package.session.duration_ms);
-        if (result != PLAYBACK_SCHEDULER_OK)
+    }
+
+    {
+        static uint64_t video_perf_started_ms = 0ULL;
+        static uint64_t video_perf_present_total_ms = 0ULL;
+        static uint32_t video_perf_present_max_ms = 0U;
+        static uint32_t video_perf_pump_count = 0U;
+        uint64_t now_ms = tal_system_get_millisecond();
+
+        if (video_perf_started_ms == 0ULL)
         {
-            return result;
+            video_perf_started_ms = now_ms;
         }
-        playback_scheduler_set_runtime(
-            state,
-            (state->video_exhausted && (state->video_count == 0U))
-                ? PLAYBACK_STATE_COMPLETED
-                : PLAYBACK_STATE_BUFFERING,
-            PLAYBACK_ERROR_NONE
-        );
-        return PLAYBACK_SCHEDULER_OK;
-    }
-
-    if (!playback_scheduler_audio_ready(&audio_status) || !playback_scheduler_video_ready(state))
-    {
-        playback_scheduler_set_audio_output(state, false);
-        if (speaker_status.desired_streaming)
+        video_perf_present_total_ms += present_ms;
+        if (present_ms > video_perf_present_max_ms)
         {
-            (void)playback_speaker_link_stop(&state->speaker);
+            video_perf_present_max_ms = present_ms;
         }
-        playback_scheduler_set_runtime(state, PLAYBACK_STATE_BUFFERING, PLAYBACK_ERROR_NONE);
-        return PLAYBACK_SCHEDULER_OK;
+        video_perf_pump_count++;
+
+        {
+            uint64_t wall_ms = now_ms >= video_perf_started_ms
+                                   ? now_ms - video_perf_started_ms
+                                   : 0ULL;
+            if (wall_ms >= PLAYBACK_SCHEDULER_PERF_LOG_INTERVAL_MS)
+            {
+                PR_NOTICE(
+                    "[DEBUG-avperf] video_pump wall=%llu pumps=%u present_total=%llu present_max=%u video_fill=%u",
+                    (unsigned long long)wall_ms,
+                    (unsigned int)video_perf_pump_count,
+                    (unsigned long long)video_perf_present_total_ms,
+                    (unsigned int)video_perf_present_max_ms,
+                    (unsigned int)video_fill_ms
+                );
+                video_perf_started_ms = now_ms;
+                video_perf_present_total_ms = 0ULL;
+                video_perf_present_max_ms = 0U;
+                video_perf_pump_count = 0U;
+            }
+        }
     }
 
-    if (!speaker_status.desired_streaming)
-    {
-        (void)playback_speaker_link_start(&state->speaker);
-    }
-    if (speaker_status.state != PLAYBACK_SPEAKER_STREAMING)
-    {
-        playback_scheduler_set_audio_output(state, false);
-        playback_scheduler_set_runtime(state, PLAYBACK_STATE_WAITING_SPEAKER, PLAYBACK_ERROR_NONE);
-        return PLAYBACK_SCHEDULER_OK;
-    }
-
-    playback_scheduler_set_audio_output(state, true);
-    playback_scheduler_set_runtime(state, PLAYBACK_STATE_PLAYING, PLAYBACK_ERROR_NONE);
-    result = playback_scheduler_present_due(state, state->position_ms);
-    return result;
+    (void)pump_started_ms;
+    return PLAYBACK_SCHEDULER_OK;
 }
 
 playback_media_scheduler_result_t playback_media_scheduler_get_snapshot(
@@ -1109,7 +1693,7 @@ playback_media_scheduler_result_t playback_media_scheduler_get_snapshot(
 {
     playback_media_scheduler_state_t *state = playback_scheduler_get_state(scheduler);
     playback_mp3_status_t audio_status;
-    playback_speaker_link_status_t speaker_status;
+    playback_wired_speaker_status_t speaker_status;
 
     if ((state == NULL) || (snapshot == NULL))
     {
@@ -1117,14 +1701,19 @@ playback_media_scheduler_result_t playback_media_scheduler_get_snapshot(
                    ? PLAYBACK_SCHEDULER_INVALID_ARGUMENT
                    : PLAYBACK_SCHEDULER_NOT_PREPARED;
     }
+    tal_mutex_lock(state->audio_mutex);
     if (playback_mp3_audio_get_status(&state->audio, &audio_status) != PLAYBACK_MP3_OK)
     {
+        tal_mutex_unlock(state->audio_mutex);
         return PLAYBACK_SCHEDULER_AUDIO_FAILED;
     }
-    if (playback_speaker_link_get_status(&state->speaker, &speaker_status) != PLAYBACK_SPEAKER_LINK_OK)
+    if (playback_wired_speaker_get_status(&state->speaker, &speaker_status) !=
+        PLAYBACK_WIRED_SPEAKER_OK)
     {
+        tal_mutex_unlock(state->audio_mutex);
         return PLAYBACK_SCHEDULER_SPEAKER_FAILED;
     }
+    tal_mutex_unlock(state->audio_mutex);
 
     memset(snapshot, 0, sizeof(*snapshot));
     tal_mutex_lock(state->status_mutex);
@@ -1133,7 +1722,7 @@ playback_media_scheduler_result_t playback_media_scheduler_get_snapshot(
     snapshot->intent = state->intent;
     snapshot->error = state->error;
     snapshot->position_ms = playback_scheduler_frames_to_ms(
-        audio_status.consumed_pcm_frames,
+        speaker_status.audible_pcm_frames,
         audio_status.sample_rate
     );
     if (snapshot->position_ms > state->package.session.duration_ms)
@@ -1148,7 +1737,12 @@ playback_media_scheduler_result_t playback_media_scheduler_get_snapshot(
     snapshot->next_video_sample = state->next_video_sample;
     snapshot->queued_video_frames = state->video_count;
     snapshot->dropped_video_frames = state->dropped_video_frames;
-    snapshot->speaker_state = speaker_status.state;
+    snapshot->speaker_started = speaker_status.started;
+    snapshot->queued_speaker_ms = playback_scheduler_frames_to_ms(
+        playback_scheduler_speaker_queued_frames(&speaker_status),
+        audio_status.sample_rate
+    );
+    snapshot->submitted_audio_frames = speaker_status.submitted_pcm_frames;
     snapshot->audio_exhausted = audio_status.source_exhausted;
     snapshot->video_exhausted = state->video_exhausted;
     tal_mutex_unlock(state->status_mutex);
@@ -1165,6 +1759,17 @@ void playback_media_scheduler_close(playback_media_scheduler_t *scheduler)
     }
     state = playback_scheduler_get_state(scheduler);
     scheduler->state = NULL;
+
+    if ((state != NULL) && state->audio_worker_running)
+    {
+        state->audio_worker_running = false;
+        (void)tal_semaphore_wait(state->audio_worker_stopped, 5000U);
+        if (state->audio_thread != NULL)
+        {
+            (void)tal_thread_delete(state->audio_thread);
+        }
+    }
+
     playback_scheduler_release_state(state);
 }
 

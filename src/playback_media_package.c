@@ -255,11 +255,15 @@ playback_package_result_t playback_audio_index_parse(
         if ((record.byte_length == 0U) || (record_end > audio_byte_length) ||
             ((record_index == 0U) && (record.pcm_sample_position != 0U)) ||
             ((record_index > 0U) && (record.pcm_sample_position <= previous_sample)) ||
-            ((record_index > 0U) && ((uint64_t)record.byte_offset < previous_end)) ||
-            ((uint64_t)record.pcm_sample_position > expected_samples))
+            ((record_index > 0U) && ((uint64_t)record.byte_offset < previous_end)))
         {
             index->count = 0U;
             return PLAYBACK_PACKAGE_INVALID_INDEX;
+        }
+
+        if ((uint64_t)record.pcm_sample_position >= expected_samples)
+        {
+            break;
         }
 
         index->records[record_index] = record;
@@ -267,7 +271,11 @@ playback_package_result_t playback_audio_index_parse(
         previous_end = record_end;
     }
 
-    index->count = record_count;
+    if (record_index == 0U)
+    {
+        return PLAYBACK_PACKAGE_INVALID_INDEX;
+    }
+    index->count = record_index;
     return PLAYBACK_PACKAGE_OK;
 }
 

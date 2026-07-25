@@ -1,7 +1,8 @@
 #ifndef MOB_SCREEN_H
 #define MOB_SCREEN_H
 
-#include "playback_bluetooth_browser.h"
+#include <stdbool.h>
+
 #include "playback_video_output.h"
 
 #ifdef __cplusplus
@@ -13,21 +14,10 @@ extern "C" {
  *
  * The caller must hold the LVGL display lock while invoking this function.
  */
-typedef void (*mob_screen_bluetooth_scan_cb)(void *context);
-typedef void (*mob_screen_bluetooth_connect_cb)(
-    void *context,
-    const uint8_t address[PLAYBACK_BLUETOOTH_ADDRESS_BYTES]
-);
-
-typedef struct
-{
-    mob_screen_bluetooth_scan_cb on_scan;
-    mob_screen_bluetooth_connect_cb on_connect;
-    void *context;
-} mob_screen_bluetooth_callbacks_t;
-
 typedef void (*mob_screen_speaker_test_cb)(void *context);
 typedef void (*mob_screen_video_test_cb)(void *context);
+typedef void (*mob_screen_av_test_cb)(void *context);
+typedef bool (*mob_screen_peer_ip_submit_cb)(void *context, const char *peer_ip);
 
 /** Configure optional speaker-test action before creating the screen. */
 void mob_screen_set_speaker_test_callback(mob_screen_speaker_test_cb on_speaker_test, void *context);
@@ -35,10 +25,17 @@ void mob_screen_set_speaker_test_callback(mob_screen_speaker_test_cb on_speaker_
 /** Configure optional H.264 video-test action before creating the screen. */
 void mob_screen_set_video_test_callback(mob_screen_video_test_cb on_video_test, void *context);
 
-/** Configure Bluetooth-page actions before creating the screen. */
-void mob_screen_set_bluetooth_callbacks(
-    const mob_screen_bluetooth_callbacks_t *callbacks
+/** Configure optional synchronized audio/video-test action before creating the screen. */
+void mob_screen_set_av_test_callback(mob_screen_av_test_cb on_av_test, void *context);
+
+/** Configure the control-board IPv4 save action before creating the screen. */
+void mob_screen_set_peer_ip_submit_callback(
+    mob_screen_peer_ip_submit_cb on_submit,
+    void *context
 );
+
+/** Update the network page with the current local and control-board IPv4 addresses. */
+void mob_screen_update_network(const char *local_ip, const char *peer_ip);
 
 void mob_screen_create(void);
 
@@ -52,20 +49,6 @@ void mob_screen_neutralize_panel(void);
 
 /** Show a minimal output-only state screen without disturbing paused/completed video. */
 void mob_screen_show_state(playback_state_t state, const char *diagnostic);
-
-/** Replace the Bluetooth page device list. Thread-safe. */
-void mob_screen_show_bluetooth_devices(
-    const playback_bluetooth_browser_device_t *devices,
-    size_t device_count,
-    bool scanning
-);
-
-/** Update Bluetooth-page connection status. Thread-safe. */
-void mob_screen_show_bluetooth_status(
-    playback_bluetooth_browser_status_t status,
-    const uint8_t address[PLAYBACK_BLUETOOTH_ADDRESS_BYTES],
-    const char *detail
-);
 
 /**
  * @brief Present a contiguous native-endian RGB565 surface through LVGL.

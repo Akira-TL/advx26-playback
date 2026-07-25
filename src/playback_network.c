@@ -16,7 +16,22 @@
 
 static TIMER_ID playback_wifi_retry_timer;
 static bool playback_wifi_connected;
-static char playback_wifi_gateway[64];
+static char playback_wifi_local_ip[16];
+static char playback_wifi_gateway[16];
+static playback_network_status_callback_t playback_wifi_status_callback;
+static void *playback_wifi_status_context;
+
+static void playback_wifi_publish_status(void)
+{
+    if (playback_wifi_status_callback != NULL)
+    {
+        playback_wifi_status_callback(
+            playback_wifi_status_context,
+            playback_wifi_connected,
+            playback_wifi_local_ip
+        );
+    }
+}
 
 static void playback_wifi_retry_callback(TIMER_ID timer_id, void *argument)
 {
@@ -61,8 +76,17 @@ static void playback_wifi_event_callback(WF_EVENT_E event, void *argument)
                     station_ip.ip,
                     station_ip.gw
                 );
-                strncpy(playback_wifi_gateway, station_ip.gw,
-                        sizeof(playback_wifi_gateway) - 1U);
+                strncpy(
+                    playback_wifi_local_ip,
+                    station_ip.ip,
+                    sizeof(playback_wifi_local_ip) - 1U
+                );
+                strncpy(
+                    playback_wifi_gateway,
+                    station_ip.gw,
+                    sizeof(playback_wifi_gateway) - 1U
+                );
+                playback_wifi_publish_status();
             }
             else
             {
@@ -72,6 +96,9 @@ static void playback_wifi_event_callback(WF_EVENT_E event, void *argument)
 
         case WFE_CONNECT_FAILED:
             playback_wifi_connected = false;
+            playback_wifi_local_ip[0] = '\0';
+            playback_wifi_gateway[0] = '\0';
+            playback_wifi_publish_status();
             PR_WARN("Playback Wi-Fi connection failed");
             if (playback_wifi_retry_timer != NULL)
             {
@@ -85,6 +112,9 @@ static void playback_wifi_event_callback(WF_EVENT_E event, void *argument)
 
         case WFE_DISCONNECTED:
             playback_wifi_connected = false;
+            playback_wifi_local_ip[0] = '\0';
+            playback_wifi_gateway[0] = '\0';
+            playback_wifi_publish_status();
             PR_WARN("Playback Wi-Fi disconnected");
             if (playback_wifi_retry_timer != NULL)
             {
@@ -99,6 +129,15 @@ static void playback_wifi_event_callback(WF_EVENT_E event, void *argument)
         default:
             break;
     }
+}
+
+void playback_network_set_status_callback(
+    playback_network_status_callback_t callback,
+    void *context
+)
+{
+    playback_wifi_status_callback = callback;
+    playback_wifi_status_context = context;
 }
 
 OPERATE_RET playback_network_start(void)
@@ -151,6 +190,9 @@ OPERATE_RET playback_network_start(void)
     }
 
     playback_wifi_connected = false;
+    playback_wifi_local_ip[0] = '\0';
+    playback_wifi_gateway[0] = '\0';
+    playback_wifi_publish_status();
     (void)tal_sw_timer_start(
         playback_wifi_retry_timer,
         PLAYBACK_WIFI_RETRY_INTERVAL_MS,
@@ -162,6 +204,11 @@ OPERATE_RET playback_network_start(void)
         (int8_t *)DEMO_WIFI_PASSWORD
     );
 #endif
+}
+
+const char *playback_network_get_local_ip(void)
+{
+    return playback_wifi_local_ip;
 }
 
 const char *playback_network_get_gateway(void)

@@ -66,12 +66,6 @@ playback_engine_result_t playback_engine_get_snapshot(
     playback_snapshot_t *snapshot
 );
 
-/** Update the speaker selected by the local Bluetooth page for future sessions. */
-playback_engine_result_t playback_engine_set_speaker_address(
-    playback_engine_t *engine,
-    const uint8_t address[PLAYBACK_SPEAKER_LINK_ADDRESS_BYTES]
-);
-
 void playback_engine_close(playback_engine_t *engine);
 const char *playback_engine_result_name(playback_engine_result_t result);
 

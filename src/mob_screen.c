@@ -31,27 +31,31 @@ static lv_obj_t *status_title = NULL;
 static lv_obj_t *status_detail = NULL;
 static lv_obj_t *video_screen = NULL;
 static lv_obj_t *video_image = NULL;
-static lv_obj_t *bluetooth_screen = NULL;
-static lv_obj_t *bluetooth_list = NULL;
-static lv_obj_t *bluetooth_status = NULL;
-static lv_obj_t *bluetooth_scan_button = NULL;
-static lv_obj_t *speaker_test_button = NULL;
-static lv_obj_t *video_test_button = NULL;
+static lv_obj_t *diagnostics_screen = NULL;
+static lv_obj_t *network_local_label = NULL;
+static lv_obj_t *network_peer_textarea = NULL;
+static lv_obj_t *network_status_label = NULL;
 static lv_img_dsc_t video_frame_descriptor;
 static uint16_t *video_frame_pixels = NULL;
 static size_t video_frame_bytes = 0U;
-static mob_screen_bluetooth_callbacks_t bluetooth_callbacks;
 static mob_screen_speaker_test_cb speaker_test_callback = NULL;
 static void *speaker_test_context = NULL;
 static mob_screen_video_test_cb video_test_callback = NULL;
 static void *video_test_context = NULL;
+static mob_screen_av_test_cb av_test_callback = NULL;
+static void *av_test_context = NULL;
+static mob_screen_peer_ip_submit_cb peer_ip_submit_callback = NULL;
+static void *peer_ip_submit_context = NULL;
+static char network_local_ip[16];
+static char network_peer_ip[16];
 
-typedef struct
-{
-    uint8_t address[PLAYBACK_BLUETOOTH_ADDRESS_BYTES];
-} mob_bluetooth_row_t;
-
-static mob_bluetooth_row_t bluetooth_rows[PLAYBACK_BLUETOOTH_BROWSER_MAX_DEVICES];
+static const char *mob_ip_keypad_map[] = {
+    "1", "2", "3", "\n",
+    "4", "5", "6", "\n",
+    "7", "8", "9", "\n",
+    ".", "0", LV_SYMBOL_BACKSPACE, "\n",
+    "CLEAR", "SAVE", "",
+};
 
 static bool video_surface_is_valid(const playback_rgb565_surface_t *surface)
 {
@@ -291,7 +295,7 @@ static void create_hero_card(lv_obj_t *screen)
     lv_obj_align(title, LV_ALIGN_LEFT_MID, 0, -8);
 
     lv_obj_t *description =
-        create_label(card, "Board Link media output\nH.264 video / A2DP audio", MOB_COLOR_MUTED, LV_TEXT_ALIGN_LEFT);
+        create_label(card, "Board Link media output\nH.264 video / wired PCM audio", MOB_COLOR_MUTED, LV_TEXT_ALIGN_LEFT);
     lv_obj_set_style_text_line_space(description, 6, 0);
     lv_obj_align(description, LV_ALIGN_BOTTOM_LEFT, 0, -66);
 
@@ -313,136 +317,21 @@ static void create_hero_card(lv_obj_t *screen)
 
 static void create_footer(lv_obj_t *screen)
 {
-    lv_obj_t *footer = create_label(screen, "SWIPE LEFT  ·  BLUETOOTH", MOB_COLOR_MUTED, LV_TEXT_ALIGN_CENTER);
+    lv_obj_t *footer = create_label(screen, "SWIPE LEFT  ·  NETWORK CONTROL", MOB_COLOR_MUTED, LV_TEXT_ALIGN_CENTER);
     lv_obj_set_style_text_letter_space(footer, 2, 0);
     lv_obj_align(footer, LV_ALIGN_BOTTOM_MID, 0, -18);
 }
 
-static void mob_bluetooth_format_address(
-    char *destination,
-    size_t capacity,
-    const uint8_t address[PLAYBACK_BLUETOOTH_ADDRESS_BYTES]
-)
-{
-    if ((destination == NULL) || (capacity == 0U))
-    {
-        return;
-    }
-    if (address == NULL)
-    {
-        destination[0] = '\0';
-        return;
-    }
-    (void)snprintf(
-        destination,
-        capacity,
-        "%02X:%02X:%02X:%02X:%02X:%02X",
-        address[5],
-        address[4],
-        address[3],
-        address[2],
-        address[1],
-        address[0]
-    );
-}
-
-static void mob_bluetooth_start_scan(void)
-{
-    if (bluetooth_status != NULL)
-    {
-        lv_label_set_text(bluetooth_status, "SCANNING  ·  Keep the speaker in pairing mode");
-        lv_obj_set_style_text_color(bluetooth_status, MOB_COLOR_ACCENT, 0);
-    }
-    if (bluetooth_list != NULL)
-    {
-        lv_obj_clean(bluetooth_list);
-        lv_obj_t *label = create_label(
-            bluetooth_list,
-            "Scanning nearby classic Bluetooth devices...",
-            MOB_COLOR_MUTED,
-            LV_TEXT_ALIGN_CENTER
-        );
-        lv_obj_set_width(label, lv_pct(100));
-        lv_obj_set_style_pad_top(label, 62, 0);
-    }
-    if (bluetooth_callbacks.on_scan != NULL)
-    {
-        bluetooth_callbacks.on_scan(bluetooth_callbacks.context);
-    }
-}
-
-static void mob_bluetooth_scan_event(lv_event_t *event)
-{
-    if (lv_event_get_code(event) == LV_EVENT_CLICKED)
-    {
-        mob_bluetooth_start_scan();
-    }
-}
-
-static void mob_speaker_test_event(lv_event_t *event)
-{
-    if (lv_event_get_code(event) == LV_EVENT_CLICKED)
-    {
-        if (speaker_test_callback != NULL)
-        {
-            speaker_test_callback(speaker_test_context);
-        }
-    }
-}
-
-static void mob_video_test_event(lv_event_t *event)
-{
-    if ((lv_event_get_code(event) == LV_EVENT_CLICKED) &&
-        (video_test_callback != NULL))
-    {
-        video_test_callback(video_test_context);
-    }
-}
-
-static void mob_bluetooth_device_event(lv_event_t *event)
-{
-    mob_bluetooth_row_t *row;
-
-    if (lv_event_get_code(event) != LV_EVENT_CLICKED)
-    {
-        return;
-    }
-    row = lv_event_get_user_data(event);
-    if ((row != NULL) && (bluetooth_callbacks.on_connect != NULL))
-    {
-        char address[24U];
-        char status_text[64U];
-
-        mob_bluetooth_format_address(address, sizeof(address), row->address);
-        (void)snprintf(
-            status_text,
-            sizeof(status_text),
-            "CONNECTING  ·  %s",
-            address
-        );
-        if (bluetooth_status != NULL)
-        {
-            lv_label_set_text(bluetooth_status, status_text);
-            lv_obj_set_style_text_color(bluetooth_status, MOB_COLOR_ACCENT, 0);
-        }
-        bluetooth_callbacks.on_connect(
-            bluetooth_callbacks.context,
-            row->address
-        );
-    }
-}
-
-static void mob_bluetooth_load_page(void)
+static void mob_diagnostics_load_page(void)
 {
     lv_disp_t *display = lv_disp_get_default();
 
-    if ((display == NULL) || (bluetooth_screen == NULL))
+    if ((display == NULL) || (diagnostics_screen == NULL))
     {
         return;
     }
-    lv_disp_load_scr(bluetooth_screen);
+    lv_disp_load_scr(diagnostics_screen);
     lv_refr_now(display);
-    mob_bluetooth_start_scan();
 }
 
 static void mob_idle_gesture_event(lv_event_t *event)
@@ -456,11 +345,11 @@ static void mob_idle_gesture_event(lv_event_t *event)
     input = lv_indev_get_act();
     if ((input != NULL) && (lv_indev_get_gesture_dir(input) == LV_DIR_LEFT))
     {
-        mob_bluetooth_load_page();
+        mob_diagnostics_load_page();
     }
 }
 
-static void mob_bluetooth_gesture_event(lv_event_t *event)
+static void mob_diagnostics_gesture_event(lv_event_t *event)
 {
     lv_indev_t *input;
     lv_disp_t *display;
@@ -482,136 +371,204 @@ static void mob_bluetooth_gesture_event(lv_event_t *event)
     }
 }
 
-static bool configure_bluetooth_screen(void)
+static void mob_network_copy_ip(char destination[16], const char *source)
+{
+    if (source == NULL)
+    {
+        destination[0] = '\0';
+        return;
+    }
+    strncpy(destination, source, 15U);
+    destination[15] = '\0';
+}
+
+static void mob_network_refresh_labels(void)
+{
+    char text[80];
+
+    if (network_local_label != NULL)
+    {
+        snprintf(
+            text,
+            sizeof(text),
+            "THIS BOARD\n%s:%u",
+            network_local_ip[0] != '\0' ? network_local_ip : "CONNECTING...",
+            8787U
+        );
+        lv_label_set_text(network_local_label, text);
+    }
+    if (network_peer_textarea != NULL)
+    {
+        lv_textarea_set_text(network_peer_textarea, network_peer_ip);
+    }
+}
+
+static void mob_ip_keypad_event(lv_event_t *event)
+{
+    lv_obj_t *keypad;
+    uint16_t selected;
+    const char *key;
+    const char *value;
+
+    if ((lv_event_get_code(event) != LV_EVENT_VALUE_CHANGED) ||
+        (network_peer_textarea == NULL))
+    {
+        return;
+    }
+    keypad = lv_event_get_target(event);
+    selected = lv_btnmatrix_get_selected_btn(keypad);
+    key = lv_btnmatrix_get_btn_text(keypad, selected);
+    if (key == NULL)
+    {
+        return;
+    }
+
+    if (strcmp(key, LV_SYMBOL_BACKSPACE) == 0)
+    {
+        lv_textarea_del_char(network_peer_textarea);
+        return;
+    }
+    if (strcmp(key, "CLEAR") == 0)
+    {
+        lv_textarea_set_text(network_peer_textarea, "");
+        lv_label_set_text(network_status_label, "ENTER CONTROL BOARD IPv4");
+        return;
+    }
+    if (strcmp(key, "SAVE") == 0)
+    {
+        value = lv_textarea_get_text(network_peer_textarea);
+        if ((peer_ip_submit_callback != NULL) &&
+            peer_ip_submit_callback(peer_ip_submit_context, value))
+        {
+            char status_text[64];
+
+            mob_network_copy_ip(network_peer_ip, value);
+            snprintf(
+                status_text,
+                sizeof(status_text),
+                "SAVED  %s:%u  ·  STATUS 2 Hz",
+                network_peer_ip,
+                8787U
+            );
+            lv_label_set_text(network_status_label, status_text);
+        }
+        else
+        {
+            lv_label_set_text(network_status_label, "INVALID IPv4 ADDRESS");
+        }
+        return;
+    }
+
+    if ((strlen(lv_textarea_get_text(network_peer_textarea)) < 15U) &&
+        (((key[0] >= '0') && (key[0] <= '9') && (key[1] == '\0')) ||
+         (strcmp(key, ".") == 0)))
+    {
+        lv_textarea_add_text(network_peer_textarea, key);
+    }
+}
+
+static bool configure_diagnostics_screen(void)
 {
     lv_obj_t *title;
     lv_obj_t *hint;
-    lv_obj_t *scan_label;
+    lv_obj_t *card;
+    lv_obj_t *local_title;
+    lv_obj_t *peer_title;
+    lv_obj_t *keypad;
 
-    bluetooth_screen = lv_obj_create(NULL);
-    if (bluetooth_screen == NULL)
+    diagnostics_screen = lv_obj_create(NULL);
+    if (diagnostics_screen == NULL)
     {
         return false;
     }
-    lv_obj_set_style_bg_color(bluetooth_screen, MOB_COLOR_BACKGROUND, 0);
-    lv_obj_set_style_bg_opa(bluetooth_screen, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(bluetooth_screen, 0, 0);
-    lv_obj_set_style_pad_all(bluetooth_screen, 0, 0);
-    lv_obj_clear_flag(bluetooth_screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(diagnostics_screen, MOB_COLOR_BACKGROUND, 0);
+    lv_obj_set_style_bg_opa(diagnostics_screen, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(diagnostics_screen, 0, 0);
+    lv_obj_set_style_pad_all(diagnostics_screen, 0, 0);
+    lv_obj_clear_flag(diagnostics_screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(
-        bluetooth_screen,
-        mob_bluetooth_gesture_event,
+        diagnostics_screen,
+        mob_diagnostics_gesture_event,
         LV_EVENT_GESTURE,
         NULL
     );
 
     title = create_label(
-        bluetooth_screen,
-        "BLUETOOTH SPEAKERS",
+        diagnostics_screen,
+        "NETWORK CONTROL",
         MOB_COLOR_PRIMARY,
         LV_TEXT_ALIGN_LEFT
     );
     lv_obj_set_style_text_letter_space(title, 2, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 24, 18);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 24, 16);
 
     hint = create_label(
-        bluetooth_screen,
-        "Tap a device to pair  ·  Swipe right to return",
+        diagnostics_screen,
+        "HTTP JSON  ·  PORT 8787  ·  Swipe right to return",
         MOB_COLOR_MUTED,
         LV_TEXT_ALIGN_LEFT
     );
-    lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 24, 46);
+    lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 24, 42);
 
-    bluetooth_scan_button = lv_btn_create(bluetooth_screen);
-    lv_obj_set_size(bluetooth_scan_button, 84, 34);
-    lv_obj_align(bluetooth_scan_button, LV_ALIGN_TOP_RIGHT, -22, 16);
-    lv_obj_set_style_bg_color(bluetooth_scan_button, MOB_COLOR_ACCENT_DARK, 0);
-    lv_obj_set_style_radius(bluetooth_scan_button, 17, 0);
-    lv_obj_add_event_cb(
-        bluetooth_scan_button,
-        mob_bluetooth_scan_event,
-        LV_EVENT_CLICKED,
-        NULL
-    );
-    scan_label = create_label(
-        bluetooth_scan_button,
-        "SCAN",
-        MOB_COLOR_ACCENT,
-        LV_TEXT_ALIGN_CENTER
-    );
-    lv_obj_center(scan_label);
+    card = lv_obj_create(diagnostics_screen);
+    lv_obj_set_size(card, 208, 226);
+    lv_obj_align(card, LV_ALIGN_BOTTOM_LEFT, 24, -14);
+    lv_obj_set_style_bg_color(card, MOB_COLOR_SURFACE, 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, MOB_COLOR_SURFACE_ALT, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_pad_all(card, 18, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
-    speaker_test_button = lv_btn_create(bluetooth_screen);
-    lv_obj_set_size(speaker_test_button, 84, 34);
-    lv_obj_align(speaker_test_button, LV_ALIGN_TOP_RIGHT, -112, 16);
-    lv_obj_set_style_bg_color(speaker_test_button, MOB_COLOR_ACCENT_DARK, 0);
-    lv_obj_set_style_radius(speaker_test_button, 17, 0);
-    lv_obj_add_event_cb(
-        speaker_test_button,
-        mob_speaker_test_event,
-        LV_EVENT_CLICKED,
-        NULL
-    );
-    lv_obj_t *test_label = create_label(
-        speaker_test_button,
-        "AUDIO",
-        MOB_COLOR_ACCENT,
-        LV_TEXT_ALIGN_CENTER
-    );
-    lv_obj_center(test_label);
+    local_title = create_label(card, "PLAYBACK IP", MOB_COLOR_MUTED, LV_TEXT_ALIGN_LEFT);
+    lv_obj_set_style_text_letter_space(local_title, 1, 0);
+    lv_obj_align(local_title, LV_ALIGN_TOP_LEFT, 0, 0);
 
-    video_test_button = lv_btn_create(bluetooth_screen);
-    lv_obj_set_size(video_test_button, 84, 34);
-    lv_obj_align(video_test_button, LV_ALIGN_TOP_RIGHT, -202, 16);
-    lv_obj_set_style_bg_color(video_test_button, MOB_COLOR_ACCENT_DARK, 0);
-    lv_obj_set_style_radius(video_test_button, 17, 0);
-    lv_obj_add_event_cb(
-        video_test_button,
-        mob_video_test_event,
-        LV_EVENT_CLICKED,
-        NULL
-    );
-    lv_obj_t *video_label = create_label(
-        video_test_button,
-        "VIDEO",
-        MOB_COLOR_ACCENT,
-        LV_TEXT_ALIGN_CENTER
-    );
-    lv_obj_center(video_label);
+    network_local_label = create_label(card, "", MOB_COLOR_ACCENT, LV_TEXT_ALIGN_LEFT);
+    lv_obj_set_style_text_line_space(network_local_label, 4, 0);
+    lv_obj_align(network_local_label, LV_ALIGN_TOP_LEFT, 0, 24);
 
-    bluetooth_status = create_label(
-        bluetooth_screen,
-        "Ready to scan",
-        MOB_COLOR_ACCENT,
+    peer_title = create_label(card, "CONTROL BOARD IP", MOB_COLOR_MUTED, LV_TEXT_ALIGN_LEFT);
+    lv_obj_set_style_text_letter_space(peer_title, 1, 0);
+    lv_obj_align(peer_title, LV_ALIGN_TOP_LEFT, 0, 82);
+
+    network_peer_textarea = lv_textarea_create(card);
+    lv_obj_set_size(network_peer_textarea, 172, 42);
+    lv_obj_align(network_peer_textarea, LV_ALIGN_TOP_LEFT, 0, 106);
+    lv_textarea_set_one_line(network_peer_textarea, true);
+    lv_textarea_set_max_length(network_peer_textarea, 15U);
+    lv_textarea_set_accepted_chars(network_peer_textarea, "0123456789.");
+    lv_textarea_set_placeholder_text(network_peer_textarea, "192.168.0.2");
+    lv_obj_set_style_bg_color(network_peer_textarea, MOB_COLOR_SURFACE_ALT, 0);
+    lv_obj_set_style_text_color(network_peer_textarea, MOB_COLOR_PRIMARY, 0);
+    lv_obj_set_style_border_width(network_peer_textarea, 0, 0);
+    lv_obj_set_style_radius(network_peer_textarea, 10, 0);
+
+    network_status_label = create_label(
+        card,
+        "ENTER CONTROL BOARD IPv4",
+        MOB_COLOR_MUTED,
         LV_TEXT_ALIGN_LEFT
     );
-    lv_obj_set_width(bluetooth_status, lv_pct(90));
-    lv_obj_align(bluetooth_status, LV_ALIGN_TOP_LEFT, 24, 72);
+    lv_obj_set_width(network_status_label, 172);
+    lv_obj_align(network_status_label, LV_ALIGN_TOP_LEFT, 0, 166);
 
-    bluetooth_list = lv_obj_create(bluetooth_screen);
-    lv_obj_set_size(bluetooth_list, lv_pct(90), 212);
-    lv_obj_align(bluetooth_list, LV_ALIGN_BOTTOM_MID, 0, -12);
-    lv_obj_set_flex_flow(bluetooth_list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_bg_color(bluetooth_list, MOB_COLOR_SURFACE, 0);
-    lv_obj_set_style_bg_opa(bluetooth_list, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(bluetooth_list, MOB_COLOR_SURFACE_ALT, 0);
-    lv_obj_set_style_border_width(bluetooth_list, 1, 0);
-    lv_obj_set_style_radius(bluetooth_list, 18, 0);
-    lv_obj_set_style_pad_all(bluetooth_list, 8, 0);
-    lv_obj_set_style_pad_row(bluetooth_list, 6, 0);
+    keypad = lv_btnmatrix_create(diagnostics_screen);
+    lv_obj_set_size(keypad, 210, 226);
+    lv_obj_align(keypad, LV_ALIGN_BOTTOM_RIGHT, -24, -14);
+    lv_btnmatrix_set_map(keypad, mob_ip_keypad_map);
+    lv_obj_set_style_bg_color(keypad, MOB_COLOR_SURFACE, 0);
+    lv_obj_set_style_border_width(keypad, 0, 0);
+    lv_obj_set_style_radius(keypad, 18, 0);
+    lv_obj_set_style_pad_all(keypad, 8, 0);
+    lv_obj_set_style_bg_color(keypad, MOB_COLOR_SURFACE_ALT, LV_PART_ITEMS);
+    lv_obj_set_style_text_color(keypad, MOB_COLOR_PRIMARY, LV_PART_ITEMS);
+    lv_obj_set_style_radius(keypad, 8, LV_PART_ITEMS);
+    lv_obj_add_event_cb(keypad, mob_ip_keypad_event, LV_EVENT_VALUE_CHANGED, NULL);
+
+    mob_network_refresh_labels();
     return true;
-}
-
-void mob_screen_set_bluetooth_callbacks(
-    const mob_screen_bluetooth_callbacks_t *callbacks
-)
-{
-    if (callbacks == NULL)
-    {
-        memset(&bluetooth_callbacks, 0, sizeof(bluetooth_callbacks));
-        return;
-    }
-    bluetooth_callbacks = *callbacks;
 }
 
 void mob_screen_set_speaker_test_callback(
@@ -630,6 +587,57 @@ void mob_screen_set_video_test_callback(
 {
     video_test_callback = on_video_test;
     video_test_context = context;
+}
+
+void mob_screen_set_av_test_callback(
+    mob_screen_av_test_cb on_av_test,
+    void *context
+)
+{
+    av_test_callback = on_av_test;
+    av_test_context = context;
+}
+
+void mob_screen_set_peer_ip_submit_callback(
+    mob_screen_peer_ip_submit_cb on_submit,
+    void *context
+)
+{
+    peer_ip_submit_callback = on_submit;
+    peer_ip_submit_context = context;
+}
+
+void mob_screen_update_network(const char *local_ip, const char *peer_ip)
+{
+    mob_network_copy_ip(network_local_ip, local_ip);
+    mob_network_copy_ip(network_peer_ip, peer_ip);
+    if (diagnostics_screen == NULL)
+    {
+        return;
+    }
+
+    lv_vendor_disp_lock();
+    mob_network_refresh_labels();
+    if (network_status_label != NULL)
+    {
+        if (network_peer_ip[0] != '\0')
+        {
+            char status_text[64];
+            snprintf(
+                status_text,
+                sizeof(status_text),
+                "SAVED  %s:%u  ·  STATUS 2 Hz",
+                network_peer_ip,
+                8787U
+            );
+            lv_label_set_text(network_status_label, status_text);
+        }
+        else
+        {
+            lv_label_set_text(network_status_label, "ENTER CONTROL BOARD IPv4");
+        }
+    }
+    lv_vendor_disp_unlock();
 }
 
 void mob_screen_create(void)
@@ -655,7 +663,7 @@ void mob_screen_create(void)
     lv_obj_add_event_cb(screen, mob_idle_gesture_event, LV_EVENT_GESTURE, NULL);
 
     idle_screen = screen;
-    (void)configure_bluetooth_screen();
+    (void)configure_diagnostics_screen();
     lv_disp_load_scr(screen);
 }
 
@@ -708,164 +716,6 @@ void mob_screen_neutralize_panel(void)
         lv_refr_now(display);
     }
     lv_obj_del(neutral_screen);
-    lv_vendor_disp_unlock();
-}
-
-void mob_screen_show_bluetooth_devices(
-    const playback_bluetooth_browser_device_t *devices,
-    size_t device_count,
-    bool scanning
-)
-{
-    lv_disp_t *display;
-    size_t index;
-
-    lv_vendor_disp_lock();
-    display = lv_disp_get_default();
-    if ((display == NULL) || (bluetooth_list == NULL))
-    {
-        lv_vendor_disp_unlock();
-        return;
-    }
-
-    lv_obj_clean(bluetooth_list);
-    memset(bluetooth_rows, 0, sizeof(bluetooth_rows));
-    if ((devices == NULL) || (device_count == 0U))
-    {
-        lv_obj_t *empty = create_label(
-            bluetooth_list,
-            scanning ? "Scanning... keep the speaker in pairing mode" : "No classic Bluetooth devices found",
-            MOB_COLOR_MUTED,
-            LV_TEXT_ALIGN_CENTER
-        );
-        lv_obj_set_width(empty, lv_pct(100));
-        lv_obj_set_style_pad_top(empty, 62, 0);
-    }
-    else
-    {
-        if (device_count > PLAYBACK_BLUETOOTH_BROWSER_MAX_DEVICES)
-        {
-            device_count = PLAYBACK_BLUETOOTH_BROWSER_MAX_DEVICES;
-        }
-        for (index = 0U; index < device_count; ++index)
-        {
-            lv_obj_t *button;
-            lv_obj_t *name;
-            lv_obj_t *detail;
-            char address[24U];
-            char detail_text[64U];
-
-            memcpy(
-                bluetooth_rows[index].address,
-                devices[index].address,
-                sizeof(bluetooth_rows[index].address)
-            );
-            mob_bluetooth_format_address(
-                address,
-                sizeof(address),
-                devices[index].address
-            );
-            (void)snprintf(
-                detail_text,
-                sizeof(detail_text),
-                "%s  ·  RSSI %d%s",
-                address,
-                (int)devices[index].rssi,
-                devices[index].audio_device ? "  ·  AUDIO" : ""
-            );
-
-            button = lv_btn_create(bluetooth_list);
-            lv_obj_set_size(button, lv_pct(100), 58);
-            lv_obj_set_style_bg_color(button, MOB_COLOR_SURFACE_ALT, 0);
-            lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
-            lv_obj_set_style_radius(button, 14, 0);
-            lv_obj_set_style_shadow_width(button, 0, 0);
-            lv_obj_add_event_cb(
-                button,
-                mob_bluetooth_device_event,
-                LV_EVENT_CLICKED,
-                &bluetooth_rows[index]
-            );
-
-            name = create_label(
-                button,
-                devices[index].name,
-                MOB_COLOR_PRIMARY,
-                LV_TEXT_ALIGN_LEFT
-            );
-            lv_obj_set_width(name, lv_pct(96));
-            lv_obj_align(name, LV_ALIGN_TOP_LEFT, 2, 4);
-
-            detail = create_label(
-                button,
-                detail_text,
-                MOB_COLOR_MUTED,
-                LV_TEXT_ALIGN_LEFT
-            );
-            lv_obj_set_width(detail, lv_pct(96));
-            lv_obj_align(detail, LV_ALIGN_BOTTOM_LEFT, 2, -4);
-        }
-    }
-    if (lv_disp_get_scr_act(display) == bluetooth_screen)
-    {
-        lv_refr_now(display);
-    }
-    lv_vendor_disp_unlock();
-}
-
-void mob_screen_show_bluetooth_status(
-    playback_bluetooth_browser_status_t status,
-    const uint8_t address[PLAYBACK_BLUETOOTH_ADDRESS_BYTES],
-    const char *detail
-)
-{
-    lv_disp_t *display;
-    char address_text[24U];
-    char status_text[112U];
-    const char *status_name = playback_bluetooth_browser_status_name(status);
-
-    mob_bluetooth_format_address(address_text, sizeof(address_text), address);
-    if ((detail != NULL) && (detail[0] != '\0'))
-    {
-        (void)snprintf(
-            status_text,
-            sizeof(status_text),
-            "%s%s%s  ·  %s",
-            status_name,
-            address_text[0] != '\0' ? "  ·  " : "",
-            address_text,
-            detail
-        );
-    }
-    else
-    {
-        (void)snprintf(
-            status_text,
-            sizeof(status_text),
-            "%s%s%s",
-            status_name,
-            address_text[0] != '\0' ? "  ·  " : "",
-            address_text
-        );
-    }
-
-    lv_vendor_disp_lock();
-    display = lv_disp_get_default();
-    if ((display != NULL) && (bluetooth_status != NULL))
-    {
-        lv_label_set_text(bluetooth_status, status_text);
-        lv_obj_set_style_text_color(
-            bluetooth_status,
-            (status == PLAYBACK_BLUETOOTH_BROWSER_FAILED)
-                ? lv_color_hex(0xFF7A7A)
-                : MOB_COLOR_ACCENT,
-            0
-        );
-        if (lv_disp_get_scr_act(display) == bluetooth_screen)
-        {
-            lv_refr_now(display);
-        }
-    }
     lv_vendor_disp_unlock();
 }
 

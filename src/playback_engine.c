@@ -1093,45 +1093,6 @@ playback_engine_result_t playback_engine_get_snapshot(
     return PLAYBACK_ENGINE_OK;
 }
 
-playback_engine_result_t playback_engine_set_speaker_address(
-    playback_engine_t *engine,
-    const uint8_t address[PLAYBACK_SPEAKER_LINK_ADDRESS_BYTES]
-)
-{
-    playback_engine_state_t *state;
-    uint8_t index;
-    uint8_t any_nonzero = 0U;
-    uint8_t any_not_ff = 0U;
-
-    if ((engine == NULL) || (address == NULL))
-    {
-        return PLAYBACK_ENGINE_INVALID_ARGUMENT;
-    }
-    if (engine->state == NULL)
-    {
-        return PLAYBACK_ENGINE_NOT_INITIALIZED;
-    }
-    for (index = 0U; index < PLAYBACK_SPEAKER_LINK_ADDRESS_BYTES; ++index)
-    {
-        any_nonzero |= address[index];
-        any_not_ff |= (uint8_t)(address[index] ^ 0xFFU);
-    }
-    if ((any_nonzero == 0U) || (any_not_ff == 0U))
-    {
-        return PLAYBACK_ENGINE_INVALID_ARGUMENT;
-    }
-
-    state = engine->state;
-    tal_mutex_lock(state->snapshot_mutex);
-    memcpy(
-        state->config.scheduler.speaker_address,
-        address,
-        sizeof(state->config.scheduler.speaker_address)
-    );
-    tal_mutex_unlock(state->snapshot_mutex);
-    return PLAYBACK_ENGINE_OK;
-}
-
 void playback_engine_close(playback_engine_t *engine)
 {
     playback_engine_state_t *state;

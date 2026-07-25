@@ -8,8 +8,8 @@
 #include "playback_domain.h"
 #include "playback_http_range.h"
 #include "playback_media_package.h"
-#include "playback_speaker_link.h"
 #include "playback_video_output.h"
+#include "playback_wired_speaker.h"
 
 #ifdef __cplusplus
 extern "C"
@@ -17,7 +17,6 @@ extern "C"
 #endif
 
 #define PLAYBACK_SCHEDULER_VIDEO_QUEUE_CAPACITY (3U)
-#define PLAYBACK_SCHEDULER_DEFAULT_SPEAKER_LATENCY_MS (120U)
 
 typedef enum
 {
@@ -36,8 +35,11 @@ typedef enum
 typedef struct
 {
     playback_http_config_t http;
-    uint8_t speaker_address[PLAYBACK_SPEAKER_LINK_ADDRESS_BYTES];
-    uint32_t speaker_latency_ms;
+    const uint8_t *audio_memory;
+    size_t audio_memory_length;
+    const uint8_t *video_memory;
+    size_t video_memory_length;
+    playback_wired_speaker_config_t wired_speaker;
     playback_video_output_config_t video_output;
     playback_video_sink_present_fn present_video;
     void *video_context;
@@ -55,7 +57,9 @@ typedef struct
     uint32_t next_video_sample;
     uint8_t queued_video_frames;
     uint32_t dropped_video_frames;
-    playback_speaker_state_t speaker_state;
+    bool speaker_started;
+    uint32_t queued_speaker_ms;
+    uint64_t submitted_audio_frames;
     bool audio_exhausted;
     bool video_exhausted;
 } playback_media_scheduler_snapshot_t;

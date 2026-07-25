@@ -19,6 +19,9 @@ typedef struct
     size_t record_count;
     uint64_t expected_pcm_frames;
     playback_http_range_reader_t reader;
+    const uint8_t *memory_data;
+    size_t memory_length;
+    bool memory_source;
     HMP3Decoder decoder;
     uint8_t *compressed_frame;
     size_t compressed_capacity;
@@ -443,7 +446,7 @@ static playback_mp3_result_t playback_mp3_decode_current_record(
     const playback_audio_index_record_t *record = &state->records[state->next_record];
     const uint64_t record_start = record->pcm_sample_position;
     const uint64_t record_end = playback_mp3_record_end_frame(state, state->next_record);
-    playback_http_result_t http_result;
+    playback_http_result_t http_result = PLAYBACK_HTTP_OK;
     playback_mp3_result_t append_result;
     MP3FrameInfo frame_info;
     unsigned char *cursor;
@@ -451,16 +454,32 @@ static playback_mp3_result_t playback_mp3_decode_current_record(
     int decode_result;
     uint32_t decoded_frames;
 
-    http_result = playback_http_range_read_at(
-        &state->reader,
-        record->byte_offset,
-        record->byte_length,
-        state->compressed_frame,
-        state->compressed_capacity
-    );
-    if (http_result != PLAYBACK_HTTP_OK)
+    if (state->memory_source)
     {
-        return playback_mp3_http_result(http_result);
+        if (((size_t)record->byte_offset > state->memory_length) ||
+            ((size_t)record->byte_length > state->memory_length - record->byte_offset))
+        {
+            return PLAYBACK_MP3_RESOURCE_MISMATCH;
+        }
+        memcpy(
+            state->compressed_frame,
+            state->memory_data + record->byte_offset,
+            record->byte_length
+        );
+    }
+    else
+    {
+        http_result = playback_http_range_read_at(
+            &state->reader,
+            record->byte_offset,
+            record->byte_length,
+            state->compressed_frame,
+            state->compressed_capacity
+        );
+        if (http_result != PLAYBACK_HTTP_OK)
+        {
+            return playback_mp3_http_result(http_result);
+        }
     }
     if (playback_mp3_crc32(state->compressed_frame, record->byte_length) != record->crc32)
     {
@@ -622,12 +641,14 @@ static size_t playback_mp3_find_record_index(
     return (low == 0U) ? 0U : low - 1U;
 }
 
-playback_mp3_result_t playback_mp3_audio_prepare(
+static playback_mp3_result_t playback_mp3_audio_prepare_source(
     playback_mp3_audio_t *audio,
     const playback_audio_descriptor_t *descriptor,
     const playback_audio_index_t *index,
     uint32_t duration_ms,
-    const playback_http_config_t *http_config
+    const playback_http_config_t *http_config,
+    const uint8_t *memory_data,
+    size_t memory_length
 )
 {
     playback_mp3_audio_state_t *state;
@@ -642,6 +663,8 @@ playback_mp3_result_t playback_mp3_audio_prepare(
 
     if ((audio == NULL) || (descriptor == NULL) || (index == NULL) || (duration_ms == 0U) ||
         (descriptor->asset.byte_length == 0U) ||
+        ((memory_data == NULL) && (http_config == NULL)) ||
+        ((memory_data != NULL) && (memory_length != descriptor->asset.byte_length)) ||
         ((descriptor->channels != 1U) && (descriptor->channels != 2U)) ||
         (descriptor->sample_rate != PLAYBACK_MP3_SAMPLE_RATE) ||
         (descriptor->bitrate_kbps != PLAYBACK_MP3_BITRATE_KBPS) ||
@@ -680,6 +703,9 @@ playback_mp3_result_t playback_mp3_audio_prepare(
     memset(state, 0, sizeof(*state));
     state->descriptor = *descriptor;
     state->record_count = index->count;
+    state->memory_data = memory_data;
+    state->memory_length = memory_length;
+    state->memory_source = memory_data != NULL;
     state->expected_pcm_frames = expected_pcm_frames;
     state->compressed_capacity = maximum_frame_bytes;
     state->low_water_frames = (descriptor->sample_rate * PLAYBACK_MP3_PCM_LOW_WATER_MS) / 1000U;
@@ -719,23 +745,69 @@ playback_mp3_result_t playback_mp3_audio_prepare(
         return result;
     }
 
-    http_result = playback_http_range_reader_init(&state->reader, &descriptor->asset, http_config);
-    if (http_result != PLAYBACK_HTTP_OK)
+    if (!state->memory_source)
     {
-        result = playback_mp3_http_result(http_result);
-        playback_mp3_release_state(state);
-        return result;
-    }
-    http_result = playback_http_range_probe(&state->reader, &metadata);
-    if (http_result != PLAYBACK_HTTP_OK)
-    {
-        result = playback_mp3_http_result(http_result);
-        playback_mp3_release_state(state);
-        return result;
+        http_result = playback_http_range_reader_init(
+            &state->reader,
+            &descriptor->asset,
+            http_config
+        );
+        if (http_result != PLAYBACK_HTTP_OK)
+        {
+            result = playback_mp3_http_result(http_result);
+            playback_mp3_release_state(state);
+            return result;
+        }
+        http_result = playback_http_range_probe(&state->reader, &metadata);
+        if (http_result != PLAYBACK_HTTP_OK)
+        {
+            result = playback_mp3_http_result(http_result);
+            playback_mp3_release_state(state);
+            return result;
+        }
     }
 
     audio->state = state;
     return PLAYBACK_MP3_OK;
+}
+
+playback_mp3_result_t playback_mp3_audio_prepare(
+    playback_mp3_audio_t *audio,
+    const playback_audio_descriptor_t *descriptor,
+    const playback_audio_index_t *index,
+    uint32_t duration_ms,
+    const playback_http_config_t *http_config
+)
+{
+    return playback_mp3_audio_prepare_source(
+        audio,
+        descriptor,
+        index,
+        duration_ms,
+        http_config,
+        NULL,
+        0U
+    );
+}
+
+playback_mp3_result_t playback_mp3_audio_prepare_memory(
+    playback_mp3_audio_t *audio,
+    const playback_audio_descriptor_t *descriptor,
+    const playback_audio_index_t *index,
+    uint32_t duration_ms,
+    const uint8_t *data,
+    size_t data_length
+)
+{
+    return playback_mp3_audio_prepare_source(
+        audio,
+        descriptor,
+        index,
+        duration_ms,
+        NULL,
+        data,
+        data_length
+    );
 }
 
 playback_mp3_result_t playback_mp3_audio_fill(playback_mp3_audio_t *audio)

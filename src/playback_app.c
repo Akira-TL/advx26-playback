@@ -14,8 +14,10 @@
 #include "lv_vendor.h"
 #include "lvgl.h"
 #include "mob_screen.h"
-#include "playback_bluetooth_browser.h"
+#include "playback_av_test.h"
 #include "playback_board_link_gatt.h"
+#include "playback_board_link_tcp.h"
+#include "playback_board_link_uart.h"
 #include "playback_engine.h"
 #include "playback_h264_decoder.h"
 #include "playback_http_range.h"
@@ -32,10 +34,6 @@
 #include "tdd_disp_ili9488.h"
 #endif
 
-#ifndef DEMO_SPEAKER_ADDRESS
-#define DEMO_SPEAKER_ADDRESS {0U, 0U, 0U, 0U, 0U, 0U}
-#endif
-
 #ifndef DEMO_HTTP_TLS_NO_VERIFY
 #define DEMO_HTTP_TLS_NO_VERIFY (0)
 #endif
@@ -47,19 +45,19 @@
 typedef struct
 {
     playback_board_link_gatt_t gatt;
+    playback_board_link_tcp_t http;
+    playback_board_link_uart_t uart;
     playback_engine_t engine;
-    playback_bluetooth_browser_t bluetooth_browser;
-    playback_speaker_link_t speaker_probe;
     THREAD_HANDLE speaker_test_thread;
     THREAD_HANDLE video_test_thread;
+    THREAD_HANDLE av_test_thread;
     bool speaker_test_running;
     bool video_test_running;
+    bool av_test_running;
     bool started;
 } playback_app_state_t;
 
 static playback_app_state_t playback_app_state;
-static uint8_t playback_app_speaker_address[PLAYBACK_SPEAKER_LINK_ADDRESS_BYTES] =
-    DEMO_SPEAKER_ADDRESS;
 static const char *const playback_app_authorization = DEMO_PLAYBACK_AUTHORIZATION;
 
 #if defined(TUYA_T5AI_BOARD_LCD_35565) && (TUYA_T5AI_BOARD_LCD_35565 == 1)
@@ -99,246 +97,6 @@ static OPERATE_RET playback_app_prepare_display_panel(void)
 }
 #endif
 
-static bool playback_app_speaker_configured(void)
-{
-    uint8_t index;
-    uint8_t value = 0U;
-
-    for (index = 0U; index < PLAYBACK_SPEAKER_LINK_ADDRESS_BYTES; ++index)
-    {
-        value |= playback_app_speaker_address[index];
-    }
-    return value != 0U;
-}
-
-static void playback_app_bluetooth_devices_callback(
-    void *context,
-    const playback_bluetooth_browser_device_t *devices,
-    size_t device_count,
-    bool scanning
-)
-{
-    (void)context;
-    mob_screen_show_bluetooth_devices(devices, device_count, scanning);
-}
-
-static size_t playback_app_speaker_probe_read_pcm(
-    void *context,
-    int16_t *destination,
-    size_t frame_capacity
-)
-{
-    (void)context;
-
-    if ((destination == NULL) || (frame_capacity == 0U))
-    {
-        return 0U;
-    }
-    memset(
-        destination,
-        0,
-        frame_capacity * 2U * sizeof(*destination)
-    );
-    return frame_capacity;
-}
-
-static void playback_app_speaker_probe_status_callback(
-    void *context,
-    const playback_speaker_link_status_t *status
-)
-{
-    (void)context;
-
-    if (status == NULL)
-    {
-        return;
-    }
-    switch (status->state)
-    {
-        case PLAYBACK_SPEAKER_CONNECTING:
-            mob_screen_show_bluetooth_status(
-                PLAYBACK_BLUETOOTH_BROWSER_CONNECTING,
-                status->target_address,
-                "Opening A2DP audio profile"
-            );
-            break;
-        case PLAYBACK_SPEAKER_CONNECTED:
-            mob_screen_show_bluetooth_status(
-                PLAYBACK_BLUETOOTH_BROWSER_CONNECTED,
-                status->target_address,
-                "A2DP connected; starting silent keepalive"
-            );
-            break;
-        case PLAYBACK_SPEAKER_STREAMING:
-            mob_screen_show_bluetooth_status(
-                PLAYBACK_BLUETOOTH_BROWSER_PAIRED,
-                status->target_address,
-                "A2DP connected; silent keepalive active"
-            );
-            break;
-        case PLAYBACK_SPEAKER_DISCONNECTED:
-            if (status->desired_connected)
-            {
-                mob_screen_show_bluetooth_status(
-                    PLAYBACK_BLUETOOTH_BROWSER_CONNECTING,
-                    status->target_address,
-                    "A2DP disconnected; reconnecting"
-                );
-            }
-            break;
-        default:
-            break;
-    }
-}
-
-static void playback_app_close_speaker_probe(playback_app_state_t *state)
-{
-    if ((state != NULL) && (state->speaker_probe.state != NULL))
-    {
-        playback_speaker_link_close(&state->speaker_probe);
-    }
-}
-
-static void playback_app_bluetooth_status_callback(
-    void *context,
-    playback_bluetooth_browser_status_t status,
-    const uint8_t address[PLAYBACK_BLUETOOTH_ADDRESS_BYTES],
-    const char *detail
-)
-{
-    (void)context;
-    mob_screen_show_bluetooth_status(status, address, detail);
-    PR_NOTICE(
-        "Bluetooth browser status=%s detail=%s",
-        playback_bluetooth_browser_status_name(status),
-        detail != NULL ? detail : ""
-    );
-}
-
-static void playback_app_bluetooth_auth_failure_callback(
-    void *context,
-    const uint8_t address[PLAYBACK_BLUETOOTH_ADDRESS_BYTES]
-)
-{
-    playback_app_state_t *state = context;
-    playback_speaker_link_status_t speaker_status;
-
-    if ((state == NULL) || (address == NULL) ||
-        (state->speaker_probe.state == NULL) ||
-        (playback_speaker_link_get_status(
-             &state->speaker_probe,
-             &speaker_status
-         ) != PLAYBACK_SPEAKER_LINK_OK) ||
-        (memcmp(
-             speaker_status.target_address,
-             address,
-             sizeof(speaker_status.target_address)
-         ) != 0))
-    {
-        return;
-    }
-
-    PR_WARN("Bluetooth authentication failed; pausing A2DP retries until user taps again");
-    (void)playback_speaker_link_disconnect(&state->speaker_probe);
-}
-
-static void playback_app_bluetooth_scan_callback(void *context)
-{
-    playback_app_state_t *state = context;
-
-    if ((state == NULL) ||
-        !playback_bluetooth_browser_start_scan(&state->bluetooth_browser))
-    {
-        PR_WARN("Bluetooth scanner is not ready");
-    }
-}
-
-static void playback_app_bluetooth_connect_callback(
-    void *context,
-    const uint8_t address[PLAYBACK_BLUETOOTH_ADDRESS_BYTES]
-)
-{
-    playback_app_state_t *state = context;
-    playback_engine_result_t engine_result;
-    playback_speaker_link_config_t speaker_config;
-    playback_speaker_link_result_t speaker_result;
-    playback_speaker_link_status_t speaker_status;
-
-    if ((state == NULL) || (address == NULL))
-    {
-        return;
-    }
-    memcpy(
-        playback_app_speaker_address,
-        address,
-        sizeof(playback_app_speaker_address)
-    );
-    engine_result = playback_engine_set_speaker_address(&state->engine, address);
-    if (engine_result != PLAYBACK_ENGINE_OK)
-    {
-        PR_WARN(
-            "Unable to select Bluetooth speaker: %s",
-            playback_engine_result_name(engine_result)
-        );
-        return;
-    }
-    if (!playback_bluetooth_browser_connect(&state->bluetooth_browser, address))
-    {
-        PR_WARN("Unable to select Bluetooth speaker");
-        return;
-    }
-
-    if ((state->speaker_probe.state != NULL) &&
-        (playback_speaker_link_get_status(
-             &state->speaker_probe,
-             &speaker_status
-         ) == PLAYBACK_SPEAKER_LINK_OK) &&
-        (memcmp(
-             speaker_status.target_address,
-             address,
-             sizeof(speaker_status.target_address)
-         ) == 0))
-    {
-        PR_NOTICE("Reusing existing A2DP speaker link");
-        if ((speaker_status.state == PLAYBACK_SPEAKER_DISCONNECTED) ||
-            (speaker_status.state == PLAYBACK_SPEAKER_CONNECTING))
-        {
-            (void)playback_speaker_link_reconnect(&state->speaker_probe);
-        }
-        (void)playback_speaker_link_start(&state->speaker_probe);
-        return;
-    }
-
-    playback_app_close_speaker_probe(state);
-    memset(&speaker_config, 0, sizeof(speaker_config));
-    memcpy(
-        speaker_config.target_address,
-        address,
-        sizeof(speaker_config.target_address)
-    );
-    speaker_config.sample_rate = PLAYBACK_SPEAKER_LINK_SAMPLE_RATE;
-    speaker_config.channels = 2U;
-    speaker_config.read_pcm = playback_app_speaker_probe_read_pcm;
-    speaker_config.on_status = playback_app_speaker_probe_status_callback;
-    speaker_config.context = state;
-    speaker_result = playback_speaker_link_init(
-        &state->speaker_probe,
-        &speaker_config
-    );
-    if (speaker_result == PLAYBACK_SPEAKER_LINK_OK)
-    {
-        speaker_result = playback_speaker_link_start(&state->speaker_probe);
-    }
-    if (speaker_result != PLAYBACK_SPEAKER_LINK_OK)
-    {
-        PR_WARN(
-            "Bluetooth A2DP probe failed: %s",
-            playback_speaker_link_result_name(speaker_result)
-        );
-        playback_app_close_speaker_probe(state);
-    }
-}
-
 static void playback_app_show_report(const playback_report_t *report)
 {
     if (report == NULL)
@@ -361,7 +119,9 @@ static void playback_app_show_report(const playback_report_t *report)
 static void playback_app_report_sink(void *context, const playback_report_t *report)
 {
     playback_app_state_t *state = context;
-    playback_board_link_gatt_result_t result;
+    playback_board_link_gatt_result_t gatt_result;
+    playback_board_link_tcp_result_t http_result;
+    playback_board_link_uart_result_t uart_result;
 
     if ((state == NULL) || (report == NULL))
     {
@@ -369,12 +129,40 @@ static void playback_app_report_sink(void *context, const playback_report_t *rep
     }
 
     playback_app_show_report(report);
-    result = playback_board_link_gatt_send_report(&state->gatt, report);
-    if ((result != PLAYBACK_BOARD_LINK_GATT_OK) &&
-        (result != PLAYBACK_BOARD_LINK_GATT_NOT_CONNECTED) &&
-        (result != PLAYBACK_BOARD_LINK_GATT_NOT_SUBSCRIBED))
+    gatt_result = playback_board_link_gatt_send_report(&state->gatt, report);
+    if ((gatt_result != PLAYBACK_BOARD_LINK_GATT_OK) &&
+        (gatt_result != PLAYBACK_BOARD_LINK_GATT_NOT_CONNECTED) &&
+        (gatt_result != PLAYBACK_BOARD_LINK_GATT_NOT_SUBSCRIBED))
     {
-        PR_WARN("Board Link report failed: %s", playback_board_link_gatt_result_name(result));
+        PR_WARN(
+            "Board Link GATT report failed: %s",
+            playback_board_link_gatt_result_name(gatt_result)
+        );
+    }
+
+    uart_result = playback_board_link_uart_send_report(&state->uart, report);
+    if ((uart_result != PLAYBACK_BOARD_LINK_UART_OK) &&
+        (uart_result != PLAYBACK_BOARD_LINK_UART_NOT_STARTED) &&
+        (uart_result != PLAYBACK_BOARD_LINK_UART_NOT_HANDSHAKEN))
+    {
+        PR_WARN(
+            "Board Link UART report failed: %s",
+            playback_board_link_uart_result_name(uart_result)
+        );
+    }
+
+    if (report->kind != PLAYBACK_REPORT_PROGRESS)
+    {
+        http_result = playback_board_link_tcp_send_report(&state->http, report);
+        if ((http_result != PLAYBACK_BOARD_LINK_TCP_OK) &&
+            (http_result != PLAYBACK_BOARD_LINK_TCP_NOT_STARTED) &&
+            (http_result != PLAYBACK_BOARD_LINK_TCP_PEER_NOT_CONFIGURED))
+        {
+            PR_WARN(
+                "Board Link TCP report failed: %s",
+                playback_board_link_tcp_result_name(http_result)
+            );
+        }
     }
 }
 
@@ -398,6 +186,8 @@ static void playback_app_send_submit_nack(
         sizeof(report.diagnostic) - 1U
     );
     (void)playback_board_link_gatt_send_report(&state->gatt, &report);
+    (void)playback_board_link_uart_send_report(&state->uart, &report);
+    (void)playback_board_link_tcp_send_report(&state->http, &report);
 }
 
 static void playback_app_command_callback(
@@ -413,10 +203,6 @@ static void playback_app_command_callback(
         return;
     }
 
-    if (command->kind == PLAYBACK_COMMAND_LOAD_SESSION)
-    {
-        playback_app_close_speaker_probe(state);
-    }
     result = playback_engine_submit(&state->engine, command);
     if (result != PLAYBACK_ENGINE_OK)
     {
@@ -442,6 +228,106 @@ static void playback_app_link_status_callback(
             status->att_mtu
         );
     }
+}
+
+static void playback_app_uart_status_callback(
+    void *context,
+    const playback_board_link_uart_status_t *status
+)
+{
+    (void)context;
+
+    if (status != NULL)
+    {
+        PR_DEBUG(
+            "Board Link UART started=%u handshake=%u received=%u rejected=%u",
+            status->started ? 1U : 0U,
+            status->handshake_complete ? 1U : 0U,
+            (unsigned int)status->received_message_count,
+            (unsigned int)status->rejected_message_count
+        );
+    }
+}
+
+static bool playback_app_http_snapshot_callback(
+    void *context,
+    playback_report_t *report
+)
+{
+    playback_app_state_t *state = context;
+    playback_snapshot_t snapshot;
+
+    if ((state == NULL) || (report == NULL) ||
+        (playback_engine_get_snapshot(&state->engine, &snapshot) != PLAYBACK_ENGINE_OK))
+    {
+        return false;
+    }
+
+    memset(report, 0, sizeof(*report));
+    report->kind = PLAYBACK_REPORT_STATE;
+    report->state = snapshot.state;
+    report->intent = snapshot.intent;
+    report->position_ms = snapshot.position_ms;
+    report->duration_ms = snapshot.has_session ? snapshot.session.duration_ms : 0U;
+    if (snapshot.has_session)
+    {
+        strncpy(
+            report->session_id,
+            snapshot.session.session_id,
+            sizeof(report->session_id) - 1U
+        );
+    }
+    return true;
+}
+
+static void playback_app_http_status_callback(
+    void *context,
+    const playback_board_link_tcp_status_t *status
+)
+{
+    (void)context;
+
+    if (status != NULL)
+    {
+        PR_DEBUG(
+            "Board Link TCP started=%u peer=%s received=%u rejected=%u sent=%u failed=%u",
+            status->started ? 1U : 0U,
+            status->peer_configured ? status->peer_ip : "not-configured",
+            (unsigned int)status->received_command_count,
+            (unsigned int)status->rejected_request_count,
+            (unsigned int)status->sent_report_count,
+            (unsigned int)status->failed_report_count
+        );
+    }
+}
+
+static bool playback_app_peer_ip_submit(void *context, const char *peer_ip)
+{
+    playback_app_state_t *state = context;
+
+    return (state != NULL) &&
+           (playback_board_link_tcp_set_peer_ip(&state->http, peer_ip) ==
+            PLAYBACK_BOARD_LINK_TCP_OK);
+}
+
+static void playback_app_network_status_callback(
+    void *context,
+    bool connected,
+    const char *local_ip
+)
+{
+    playback_app_state_t *state = context;
+    playback_board_link_tcp_status_t http_status;
+    const char *peer_ip = "";
+
+    if ((state != NULL) &&
+        (playback_board_link_tcp_get_status(&state->http, &http_status) ==
+         PLAYBACK_BOARD_LINK_TCP_OK) &&
+        http_status.peer_configured)
+    {
+        peer_ip = http_status.peer_ip;
+    }
+    mob_screen_update_network(connected ? local_ip : "", peer_ip);
 }
 
 static void playback_app_log_information(void)
@@ -774,7 +660,8 @@ static void playback_app_speaker_test(void *context)
     playback_app_state_t *state = context;
     THREAD_CFG_T thread_config;
 
-    if ((state == NULL) || state->speaker_test_running || state->video_test_running)
+    if ((state == NULL) || state->speaker_test_running || state->video_test_running ||
+        state->av_test_running)
     {
         PR_WARN("MP3: another media test is already running");
         return;
@@ -824,7 +711,8 @@ static void playback_app_video_test(void *context)
     playback_app_state_t *state = context;
     THREAD_CFG_T thread_config;
 
-    if ((state == NULL) || state->video_test_running || state->speaker_test_running)
+    if ((state == NULL) || state->video_test_running || state->speaker_test_running ||
+        state->av_test_running)
     {
         PR_WARN("VIDEO: another media test is already running");
         return;
@@ -851,16 +739,161 @@ static void playback_app_video_test(void *context)
     }
 }
 
+static void playback_app_set_debug_asset(
+    playback_asset_t *asset,
+    const char *url,
+    uint32_t byte_length,
+    const char *sha256,
+    const char *etag
+)
+{
+    if (asset == NULL)
+    {
+        return;
+    }
+    memset(asset, 0, sizeof(*asset));
+    strncpy(asset->url, url, sizeof(asset->url) - 1U);
+    asset->byte_length = byte_length;
+    strncpy(asset->sha256, sha256, sizeof(asset->sha256) - 1U);
+    strncpy(asset->etag, etag, sizeof(asset->etag) - 1U);
+}
+
+static void playback_app_build_debug_av_session(playback_session_t *session)
+{
+    if (session == NULL)
+    {
+        return;
+    }
+    memset(session, 0, sizeof(*session));
+    strncpy(session->session_id, "debug-av-30s", sizeof(session->session_id) - 1U);
+    strncpy(session->content_id, "debug-av", sizeof(session->content_id) - 1U);
+    session->revision = 1U;
+    session->duration_ms = 30000U;
+    strncpy(session->profile, PLAYBACK_PROFILE_H264_MP3, sizeof(session->profile) - 1U);
+
+    playback_app_set_debug_asset(
+        &session->video.asset,
+        "http://advx26.babelbeast.com/debug/video.mp4",
+        1730964U,
+        "a2c111e2225cfc6d3154a9d4378498fbfd95cc0c53643f4e99e6f318afbafff4",
+        "\"a2c111e2225cfc6d3154a9d4378498fbfd95cc0c53643f4e99e6f318afbafff4\""
+    );
+    session->video.width = PLAYBACK_VIDEO_WIDTH;
+    session->video.height = PLAYBACK_VIDEO_HEIGHT;
+    session->video.fps_num = 10U;
+    session->video.fps_den = 1U;
+    session->video.max_keyframe_interval_ms = 1000U;
+    session->video.h264_profile_idc = PLAYBACK_H264_BASELINE_PROFILE_IDC;
+    session->video.h264_level_idc = 30U;
+    session->video.yuv420p = true;
+    session->video.has_b_frames = false;
+
+    playback_app_set_debug_asset(
+        &session->audio.asset,
+        "http://advx26.babelbeast.com/debug/audio.mp3",
+        480698U,
+        "704d64dd8815724f72f56d13a6caed9c258e33cb3a0fe2a44746768116007beb",
+        "\"704d64dd8815724f72f56d13a6caed9c258e33cb3a0fe2a44746768116007beb\""
+    );
+    playback_app_set_debug_asset(
+        &session->audio.index_asset,
+        "http://advx26.babelbeast.com/debug/audio.idx",
+        18416U,
+        "1e4f612fe32ee795dbac6874f87261c61aa4e25046e87022f16966a6c945aa18",
+        "\"1e4f612fe32ee795dbac6874f87261c61aa4e25046e87022f16966a6c945aa18\""
+    );
+    session->audio.sample_rate = PLAYBACK_MP3_SAMPLE_RATE;
+    session->audio.bitrate_kbps = PLAYBACK_MP3_BITRATE_KBPS;
+    session->audio.channels = 2U;
+    session->audio.index_version = PLAYBACK_AUDIO_INDEX_VERSION;
+    session->autoplay = true;
+    session->end_behavior = PLAYBACK_END_HOLD_LAST_FRAME;
+}
+
+static void playback_app_av_test_worker(void *context)
+{
+    playback_app_state_t *state = context;
+    playback_session_t session;
+    playback_media_scheduler_config_t config;
+    playback_av_test_result_t result;
+
+    memset(&config, 0, sizeof(config));
+    playback_app_build_debug_av_session(&session);
+    config.http.timeout_ms = PLAYBACK_HTTP_DEFAULT_TIMEOUT_MS;
+    config.http.authorization = playback_app_authorization;
+    config.http.tls_no_verify = DEMO_HTTP_TLS_NO_VERIFY != 0;
+    config.wired_speaker.volume = PLAYBACK_WIRED_SPEAKER_DEFAULT_VOLUME;
+    config.wired_speaker.amplifier_gpio = PLAYBACK_WIRED_SPEAKER_DEFAULT_GPIO;
+    config.wired_speaker.amplifier_gpio_polarity =
+        PLAYBACK_WIRED_SPEAKER_DEFAULT_GPIO_POLARITY;
+    config.wired_speaker.output_latency_ms =
+        PLAYBACK_WIRED_SPEAKER_DEFAULT_LATENCY_MS;
+    config.video_output.rotation = PLAYBACK_VIDEO_ROTATION_0;
+    config.video_output.swap_rgb565_bytes = false;
+    config.present_video = mob_screen_present_rgb565;
+    config.video_context = NULL;
+
+    result = playback_av_test_run(&session, &config);
+    PR_NOTICE("AV: test finished: %s", playback_av_test_result_name(result));
+    if (state != NULL)
+    {
+        state->av_test_running = false;
+        state->av_test_thread = NULL;
+        PR_NOTICE("AV: test worker finished; AV is available");
+    }
+}
+
+static void playback_app_av_test(void *context)
+{
+    playback_app_state_t *state = context;
+    playback_snapshot_t snapshot;
+    THREAD_CFG_T thread_config;
+
+    if ((state == NULL) || state->av_test_running || state->speaker_test_running ||
+        state->video_test_running)
+    {
+        PR_WARN("AV: another media test is already running");
+        return;
+    }
+    if ((playback_engine_get_snapshot(&state->engine, &snapshot) != PLAYBACK_ENGINE_OK) ||
+        snapshot.has_session)
+    {
+        PR_WARN("AV: stop the active Board Link session first");
+        return;
+    }
+
+    memset(&thread_config, 0, sizeof(thread_config));
+    thread_config.stackDepth = 24U * 1024U;
+    thread_config.priority = THREAD_PRIO_2;
+    thread_config.thrdname = "av_test";
+    thread_config.psram_mode = 1U;
+    state->av_test_running = true;
+    if (tal_thread_create_and_start(
+            &state->av_test_thread,
+            NULL,
+            NULL,
+            playback_app_av_test_worker,
+            state,
+            &thread_config
+        ) != OPRT_OK)
+    {
+        state->av_test_running = false;
+        state->av_test_thread = NULL;
+        PR_ERR("AV: unable to start test worker");
+    }
+}
+
 OPERATE_RET playback_app_start(void)
 {
     playback_board_link_gatt_config_t gatt_config;
     playback_board_link_gatt_status_t gatt_status;
+    playback_board_link_tcp_config_t http_config;
+    playback_board_link_uart_config_t uart_config;
     playback_engine_config_t engine_config;
-    playback_bluetooth_browser_config_t bluetooth_config;
-    mob_screen_bluetooth_callbacks_t screen_bluetooth_callbacks;
     playback_board_link_gatt_result_t gatt_result;
+    playback_board_link_tcp_result_t http_result;
+    playback_board_link_uart_result_t uart_result;
     playback_engine_result_t engine_result;
-    playback_speaker_link_result_t speaker_result;
     OPERATE_RET result;
 
     if (playback_app_state.started)
@@ -879,11 +912,6 @@ OPERATE_RET playback_app_start(void)
     }
 
     board_register_hardware();
-    memset(&screen_bluetooth_callbacks, 0, sizeof(screen_bluetooth_callbacks));
-    screen_bluetooth_callbacks.on_scan = playback_app_bluetooth_scan_callback;
-    screen_bluetooth_callbacks.on_connect = playback_app_bluetooth_connect_callback;
-    screen_bluetooth_callbacks.context = &playback_app_state;
-    mob_screen_set_bluetooth_callbacks(&screen_bluetooth_callbacks);
     mob_screen_set_speaker_test_callback(
         playback_app_speaker_test,
         &playback_app_state
@@ -892,12 +920,26 @@ OPERATE_RET playback_app_start(void)
         playback_app_video_test,
         &playback_app_state
     );
+    mob_screen_set_av_test_callback(
+        playback_app_av_test,
+        &playback_app_state
+    );
+    mob_screen_set_peer_ip_submit_callback(
+        playback_app_peer_ip_submit,
+        &playback_app_state
+    );
+    playback_network_set_status_callback(
+        playback_app_network_status_callback,
+        &playback_app_state
+    );
+
     lv_vendor_init(DISPLAY_NAME);
     lv_vendor_disp_lock();
     mob_screen_create();
     lv_vendor_disp_unlock();
     lv_vendor_start(5U, 1024U * 8U);
     mob_screen_neutralize_panel();
+    mob_screen_update_network("", "");
 
     result = playback_network_start();
     if (result != OPRT_OK)
@@ -906,22 +948,6 @@ OPERATE_RET playback_app_start(void)
         mob_screen_show_state(PLAYBACK_STATE_ERROR, "Wi-Fi initialization failed");
         return result;
     }
-
-    speaker_result = playback_speaker_link_prepare();
-    if (speaker_result != PLAYBACK_SPEAKER_LINK_OK)
-    {
-        PR_ERR(
-            "Beken dual-mode Bluetooth host preparation failed: %s",
-            playback_speaker_link_result_name(speaker_result)
-        );
-        mob_screen_show_bluetooth_status(
-            PLAYBACK_BLUETOOTH_BROWSER_FAILED,
-            NULL,
-            "A2DP initialization failed"
-        );
-        return OPRT_COM_ERROR;
-    }
-    PR_NOTICE("Beken dual-mode Bluetooth host prepared for A2DP and Board Link");
 
     memset(&gatt_config, 0, sizeof(gatt_config));
     gatt_config.on_command = playback_app_command_callback;
@@ -945,18 +971,36 @@ OPERATE_RET playback_app_start(void)
         return OPRT_COM_ERROR;
     }
 
+    memset(&uart_config, 0, sizeof(uart_config));
+    uart_config.boot_id = gatt_status.boot_id;
+    uart_config.on_command = playback_app_command_callback;
+    uart_config.on_status = playback_app_uart_status_callback;
+    uart_config.context = &playback_app_state;
+    uart_result = playback_board_link_uart_init(&playback_app_state.uart, &uart_config);
+    if (uart_result != PLAYBACK_BOARD_LINK_UART_OK)
+    {
+        PR_ERR(
+            "Board Link UART initialization failed: %s",
+            playback_board_link_uart_result_name(uart_result)
+        );
+        playback_board_link_gatt_close(&playback_app_state.gatt);
+        mob_screen_show_state(PLAYBACK_STATE_ERROR, "Board Link UART initialization failed");
+        return OPRT_COM_ERROR;
+    }
+
     memset(&engine_config, 0, sizeof(engine_config));
     strncpy(engine_config.boot_id, gatt_status.boot_id, sizeof(engine_config.boot_id) - 1U);
     engine_config.scheduler.http.timeout_ms = PLAYBACK_HTTP_DEFAULT_TIMEOUT_MS;
     engine_config.scheduler.http.authorization = playback_app_authorization;
     engine_config.scheduler.http.tls_no_verify = DEMO_HTTP_TLS_NO_VERIFY != 0;
-    memcpy(
-        engine_config.scheduler.speaker_address,
-        playback_app_speaker_address,
-        sizeof(engine_config.scheduler.speaker_address)
-    );
-    engine_config.scheduler.speaker_latency_ms =
-        PLAYBACK_SCHEDULER_DEFAULT_SPEAKER_LATENCY_MS;
+    engine_config.scheduler.wired_speaker.volume =
+        PLAYBACK_WIRED_SPEAKER_DEFAULT_VOLUME;
+    engine_config.scheduler.wired_speaker.amplifier_gpio =
+        PLAYBACK_WIRED_SPEAKER_DEFAULT_GPIO;
+    engine_config.scheduler.wired_speaker.amplifier_gpio_polarity =
+        PLAYBACK_WIRED_SPEAKER_DEFAULT_GPIO_POLARITY;
+    engine_config.scheduler.wired_speaker.output_latency_ms =
+        PLAYBACK_WIRED_SPEAKER_DEFAULT_LATENCY_MS;
     engine_config.scheduler.video_output.rotation = PLAYBACK_VIDEO_ROTATION_0;
     engine_config.scheduler.video_output.swap_rgb565_bytes = false;
     engine_config.scheduler.present_video = mob_screen_present_rgb565;
@@ -968,57 +1012,88 @@ OPERATE_RET playback_app_start(void)
     if (engine_result != PLAYBACK_ENGINE_OK)
     {
         PR_ERR("Playback engine initialization failed: %s", playback_engine_result_name(engine_result));
+        playback_board_link_uart_close(&playback_app_state.uart);
         playback_board_link_gatt_close(&playback_app_state.gatt);
         mob_screen_show_state(PLAYBACK_STATE_ERROR, "Playback engine initialization failed");
+        return OPRT_COM_ERROR;
+    }
+
+    memset(&http_config, 0, sizeof(http_config));
+    http_config.on_command = playback_app_command_callback;
+    http_config.on_status = playback_app_http_status_callback;
+    http_config.get_snapshot = playback_app_http_snapshot_callback;
+    http_config.context = &playback_app_state;
+    http_result = playback_board_link_tcp_init(&playback_app_state.http, &http_config);
+    if (http_result != PLAYBACK_BOARD_LINK_TCP_OK)
+    {
+        PR_ERR(
+            "Board Link TCP initialization failed: %s",
+            playback_board_link_tcp_result_name(http_result)
+        );
+        playback_engine_close(&playback_app_state.engine);
+        playback_board_link_uart_close(&playback_app_state.uart);
+        playback_board_link_gatt_close(&playback_app_state.gatt);
+        mob_screen_show_state(PLAYBACK_STATE_ERROR, "Board Link TCP initialization failed");
         return OPRT_COM_ERROR;
     }
 
     gatt_result = playback_board_link_gatt_start(&playback_app_state.gatt);
     if (gatt_result != PLAYBACK_BOARD_LINK_GATT_OK)
     {
-        PR_ERR("Board Link start failed: %s", playback_board_link_gatt_result_name(gatt_result));
+        PR_ERR("Board Link GATT start failed: %s", playback_board_link_gatt_result_name(gatt_result));
+        playback_board_link_tcp_close(&playback_app_state.http);
         playback_engine_close(&playback_app_state.engine);
+        playback_board_link_uart_close(&playback_app_state.uart);
         playback_board_link_gatt_close(&playback_app_state.gatt);
         mob_screen_show_state(PLAYBACK_STATE_ERROR, "Board Link start failed");
         return OPRT_COM_ERROR;
     }
 
-    memset(&bluetooth_config, 0, sizeof(bluetooth_config));
-    bluetooth_config.on_devices = playback_app_bluetooth_devices_callback;
-    bluetooth_config.on_status = playback_app_bluetooth_status_callback;
-    bluetooth_config.on_auth_failure = playback_app_bluetooth_auth_failure_callback;
-    bluetooth_config.context = &playback_app_state;
-    if (!playback_bluetooth_browser_init(
-            &playback_app_state.bluetooth_browser,
-            &bluetooth_config
-        ))
+    uart_result = playback_board_link_uart_start(&playback_app_state.uart);
+    if (uart_result != PLAYBACK_BOARD_LINK_UART_OK)
     {
-        PR_WARN("Classic Bluetooth browser initialization failed");
-        mob_screen_show_bluetooth_status(
-            PLAYBACK_BLUETOOTH_BROWSER_FAILED,
-            NULL,
-            "Classic Bluetooth initialization failed"
+        PR_ERR(
+            "Board Link UART start failed: %s",
+            playback_board_link_uart_result_name(uart_result)
         );
+        playback_board_link_tcp_close(&playback_app_state.http);
+        playback_board_link_gatt_close(&playback_app_state.gatt);
+        playback_engine_close(&playback_app_state.engine);
+        playback_board_link_uart_close(&playback_app_state.uart);
+        mob_screen_show_state(PLAYBACK_STATE_ERROR, "Board Link UART start failed");
+        return OPRT_COM_ERROR;
+    }
+
+    http_result = playback_board_link_tcp_start(&playback_app_state.http);
+    if (http_result != PLAYBACK_BOARD_LINK_TCP_OK)
+    {
+        PR_ERR(
+            "Board Link TCP start failed: %s",
+            playback_board_link_tcp_result_name(http_result)
+        );
+        playback_board_link_tcp_close(&playback_app_state.http);
+        playback_board_link_uart_close(&playback_app_state.uart);
+        playback_board_link_gatt_close(&playback_app_state.gatt);
+        playback_engine_close(&playback_app_state.engine);
+        mob_screen_show_state(PLAYBACK_STATE_ERROR, "Board Link TCP start failed");
+        return OPRT_COM_ERROR;
     }
 
     playback_app_state.started = true;
+    mob_screen_update_network(playback_network_get_local_ip(), "");
     mob_screen_show_state(PLAYBACK_STATE_IDLE, NULL);
-    if (!playback_app_speaker_configured())
-    {
-        PR_WARN("Fixed speaker address is not configured; define DEMO_SPEAKER_ADDRESS in demo_network_config.h");
-    }
-    else
-    {
-        PR_NOTICE(
-            "Playback speaker target: %02X:%02X:%02X:%02X:%02X:%02X",
-            playback_app_speaker_address[5],
-            playback_app_speaker_address[4],
-            playback_app_speaker_address[3],
-            playback_app_speaker_address[2],
-            playback_app_speaker_address[1],
-            playback_app_speaker_address[0]
-        );
-    }
+    PR_NOTICE(
+        "Playback audio output: onboard wired speaker, mono, %u ms latency",
+        PLAYBACK_WIRED_SPEAKER_DEFAULT_LATENCY_MS
+    );
+    PR_NOTICE(
+        "Playback network control: listen=%s:%u status_interval=%u ms",
+        playback_network_get_local_ip()[0] != '\0'
+            ? playback_network_get_local_ip()
+            : "0.0.0.0",
+        (unsigned int)PLAYBACK_BOARD_LINK_TCP_PORT,
+        500U
+    );
     PR_NOTICE(
         "Playback media authorization: %s",
         ((playback_app_authorization != NULL) && (playback_app_authorization[0] != '\0'))
@@ -1036,10 +1111,10 @@ void playback_app_stop(void)
         return;
     }
 
-    playback_app_close_speaker_probe(&playback_app_state);
-    playback_bluetooth_browser_close(&playback_app_state.bluetooth_browser);
-    playback_engine_close(&playback_app_state.engine);
+    playback_board_link_tcp_close(&playback_app_state.http);
+    playback_board_link_uart_close(&playback_app_state.uart);
     playback_board_link_gatt_close(&playback_app_state.gatt);
+    playback_engine_close(&playback_app_state.engine);
     playback_app_state.started = false;
     mob_screen_show_state(PLAYBACK_STATE_IDLE, NULL);
 }
