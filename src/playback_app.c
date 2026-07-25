@@ -45,7 +45,7 @@
 typedef struct
 {
     playback_board_link_gatt_t gatt;
-    playback_board_link_tcp_t http;
+    playback_board_link_tcp_t tcp;
     playback_board_link_uart_t uart;
     playback_engine_t engine;
     THREAD_HANDLE speaker_test_thread;
@@ -120,7 +120,7 @@ static void playback_app_report_sink(void *context, const playback_report_t *rep
 {
     playback_app_state_t *state = context;
     playback_board_link_gatt_result_t gatt_result;
-    playback_board_link_tcp_result_t http_result;
+    playback_board_link_tcp_result_t tcp_result;
     playback_board_link_uart_result_t uart_result;
 
     if ((state == NULL) || (report == NULL))
@@ -153,14 +153,14 @@ static void playback_app_report_sink(void *context, const playback_report_t *rep
 
     if (report->kind != PLAYBACK_REPORT_PROGRESS)
     {
-        http_result = playback_board_link_tcp_send_report(&state->http, report);
-        if ((http_result != PLAYBACK_BOARD_LINK_TCP_OK) &&
-            (http_result != PLAYBACK_BOARD_LINK_TCP_NOT_STARTED) &&
-            (http_result != PLAYBACK_BOARD_LINK_TCP_PEER_NOT_CONFIGURED))
+        tcp_result = playback_board_link_tcp_send_report(&state->tcp, report);
+        if ((tcp_result != PLAYBACK_BOARD_LINK_TCP_OK) &&
+            (tcp_result != PLAYBACK_BOARD_LINK_TCP_NOT_STARTED) &&
+            (tcp_result != PLAYBACK_BOARD_LINK_TCP_PEER_NOT_CONFIGURED))
         {
             PR_WARN(
                 "Board Link TCP report failed: %s",
-                playback_board_link_tcp_result_name(http_result)
+                playback_board_link_tcp_result_name(tcp_result)
             );
         }
     }
@@ -187,7 +187,7 @@ static void playback_app_send_submit_nack(
     );
     (void)playback_board_link_gatt_send_report(&state->gatt, &report);
     (void)playback_board_link_uart_send_report(&state->uart, &report);
-    (void)playback_board_link_tcp_send_report(&state->http, &report);
+    (void)playback_board_link_tcp_send_report(&state->tcp, &report);
 }
 
 static void playback_app_command_callback(
@@ -249,7 +249,7 @@ static void playback_app_uart_status_callback(
     }
 }
 
-static bool playback_app_http_snapshot_callback(
+static bool playback_app_tcp_snapshot_callback(
     void *context,
     playback_report_t *report
 )
@@ -280,7 +280,7 @@ static bool playback_app_http_snapshot_callback(
     return true;
 }
 
-static void playback_app_http_status_callback(
+static void playback_app_tcp_status_callback(
     void *context,
     const playback_board_link_tcp_status_t *status
 )
@@ -294,7 +294,7 @@ static void playback_app_http_status_callback(
             status->started ? 1U : 0U,
             status->peer_configured ? status->peer_ip : "not-configured",
             (unsigned int)status->received_command_count,
-            (unsigned int)status->rejected_request_count,
+            (unsigned int)status->rejected_message_count,
             (unsigned int)status->sent_report_count,
             (unsigned int)status->failed_report_count
         );
@@ -306,7 +306,7 @@ static bool playback_app_peer_ip_submit(void *context, const char *peer_ip)
     playback_app_state_t *state = context;
 
     return (state != NULL) &&
-           (playback_board_link_tcp_set_peer_ip(&state->http, peer_ip) ==
+           (playback_board_link_tcp_set_peer_ip(&state->tcp, peer_ip) ==
             PLAYBACK_BOARD_LINK_TCP_OK);
 }
 
@@ -317,15 +317,15 @@ static void playback_app_network_status_callback(
 )
 {
     playback_app_state_t *state = context;
-    playback_board_link_tcp_status_t http_status;
+    playback_board_link_tcp_status_t tcp_status;
     const char *peer_ip = "";
 
     if ((state != NULL) &&
-        (playback_board_link_tcp_get_status(&state->http, &http_status) ==
+        (playback_board_link_tcp_get_status(&state->tcp, &tcp_status) ==
          PLAYBACK_BOARD_LINK_TCP_OK) &&
-        http_status.peer_configured)
+        tcp_status.peer_configured)
     {
-        peer_ip = http_status.peer_ip;
+        peer_ip = tcp_status.peer_ip;
     }
     mob_screen_update_network(connected ? local_ip : "", peer_ip);
 }
@@ -887,11 +887,11 @@ OPERATE_RET playback_app_start(void)
 {
     playback_board_link_gatt_config_t gatt_config;
     playback_board_link_gatt_status_t gatt_status;
-    playback_board_link_tcp_config_t http_config;
+    playback_board_link_tcp_config_t tcp_config;
     playback_board_link_uart_config_t uart_config;
     playback_engine_config_t engine_config;
     playback_board_link_gatt_result_t gatt_result;
-    playback_board_link_tcp_result_t http_result;
+    playback_board_link_tcp_result_t tcp_result;
     playback_board_link_uart_result_t uart_result;
     playback_engine_result_t engine_result;
     OPERATE_RET result;
@@ -1018,17 +1018,18 @@ OPERATE_RET playback_app_start(void)
         return OPRT_COM_ERROR;
     }
 
-    memset(&http_config, 0, sizeof(http_config));
-    http_config.on_command = playback_app_command_callback;
-    http_config.on_status = playback_app_http_status_callback;
-    http_config.get_snapshot = playback_app_http_snapshot_callback;
-    http_config.context = &playback_app_state;
-    http_result = playback_board_link_tcp_init(&playback_app_state.http, &http_config);
-    if (http_result != PLAYBACK_BOARD_LINK_TCP_OK)
+    memset(&tcp_config, 0, sizeof(tcp_config));
+    tcp_config.boot_id = gatt_status.boot_id;
+    tcp_config.on_command = playback_app_command_callback;
+    tcp_config.on_status = playback_app_tcp_status_callback;
+    tcp_config.get_snapshot = playback_app_tcp_snapshot_callback;
+    tcp_config.context = &playback_app_state;
+    tcp_result = playback_board_link_tcp_init(&playback_app_state.tcp, &tcp_config);
+    if (tcp_result != PLAYBACK_BOARD_LINK_TCP_OK)
     {
         PR_ERR(
             "Board Link TCP initialization failed: %s",
-            playback_board_link_tcp_result_name(http_result)
+            playback_board_link_tcp_result_name(tcp_result)
         );
         playback_engine_close(&playback_app_state.engine);
         playback_board_link_uart_close(&playback_app_state.uart);
@@ -1041,7 +1042,7 @@ OPERATE_RET playback_app_start(void)
     if (gatt_result != PLAYBACK_BOARD_LINK_GATT_OK)
     {
         PR_ERR("Board Link GATT start failed: %s", playback_board_link_gatt_result_name(gatt_result));
-        playback_board_link_tcp_close(&playback_app_state.http);
+        playback_board_link_tcp_close(&playback_app_state.tcp);
         playback_engine_close(&playback_app_state.engine);
         playback_board_link_uart_close(&playback_app_state.uart);
         playback_board_link_gatt_close(&playback_app_state.gatt);
@@ -1056,7 +1057,7 @@ OPERATE_RET playback_app_start(void)
             "Board Link UART start failed: %s",
             playback_board_link_uart_result_name(uart_result)
         );
-        playback_board_link_tcp_close(&playback_app_state.http);
+        playback_board_link_tcp_close(&playback_app_state.tcp);
         playback_board_link_gatt_close(&playback_app_state.gatt);
         playback_engine_close(&playback_app_state.engine);
         playback_board_link_uart_close(&playback_app_state.uart);
@@ -1064,14 +1065,14 @@ OPERATE_RET playback_app_start(void)
         return OPRT_COM_ERROR;
     }
 
-    http_result = playback_board_link_tcp_start(&playback_app_state.http);
-    if (http_result != PLAYBACK_BOARD_LINK_TCP_OK)
+    tcp_result = playback_board_link_tcp_start(&playback_app_state.tcp);
+    if (tcp_result != PLAYBACK_BOARD_LINK_TCP_OK)
     {
         PR_ERR(
             "Board Link TCP start failed: %s",
-            playback_board_link_tcp_result_name(http_result)
+            playback_board_link_tcp_result_name(tcp_result)
         );
-        playback_board_link_tcp_close(&playback_app_state.http);
+        playback_board_link_tcp_close(&playback_app_state.tcp);
         playback_board_link_uart_close(&playback_app_state.uart);
         playback_board_link_gatt_close(&playback_app_state.gatt);
         playback_engine_close(&playback_app_state.engine);
@@ -1087,7 +1088,7 @@ OPERATE_RET playback_app_start(void)
         PLAYBACK_WIRED_SPEAKER_DEFAULT_LATENCY_MS
     );
     PR_NOTICE(
-        "Playback network control: listen=%s:%u status_interval=%u ms",
+        "Playback TCP control: listen=%s:%u status_interval=%u ms",
         playback_network_get_local_ip()[0] != '\0'
             ? playback_network_get_local_ip()
             : "0.0.0.0",
@@ -1111,7 +1112,7 @@ void playback_app_stop(void)
         return;
     }
 
-    playback_board_link_tcp_close(&playback_app_state.http);
+    playback_board_link_tcp_close(&playback_app_state.tcp);
     playback_board_link_uart_close(&playback_app_state.uart);
     playback_board_link_gatt_close(&playback_app_state.gatt);
     playback_engine_close(&playback_app_state.engine);

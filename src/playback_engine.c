@@ -54,6 +54,7 @@ typedef struct
     playback_engine_cache_entry_t cache[PLAYBACK_ENGINE_RESULT_CACHE_SIZE];
     uint8_t next_cache_entry;
     uint32_t highest_sequence_id;
+    char controller_boot_id[PLAYBACK_BOOT_ID_MAX_LEN + 1U];
     uint32_t last_progress_ms;
     playback_state_t published_state;
     playback_intent_t published_intent;
@@ -739,6 +740,20 @@ static void playback_engine_process_command(
     playback_nack_t nack;
     uint64_t fingerprint;
     bool accepted;
+
+    if ((command->kind == PLAYBACK_COMMAND_HELLO) &&
+        (command->payload.hello.boot_id[0] != '\0') &&
+        (strcmp(state->controller_boot_id, command->payload.hello.boot_id) != 0))
+    {
+        playback_engine_copy_string(
+            state->controller_boot_id,
+            sizeof(state->controller_boot_id),
+            command->payload.hello.boot_id
+        );
+        memset(state->cache, 0, sizeof(state->cache));
+        state->next_cache_entry = 0U;
+        state->highest_sequence_id = 0U;
+    }
 
     fingerprint = playback_engine_command_fingerprint(command);
     cached = playback_engine_find_cache(state, command->sequence_id);

@@ -17,7 +17,7 @@ void playback_network_set_status_callback(
     void *context
 );
 
-/** Initialize the fixed runtime Wi-Fi connection used by media and Board Link HTTP. */
+/** Initialize the fixed runtime Wi-Fi connection used by media and Board Link TCP. */
 OPERATE_RET playback_network_start(void);
 
 /** Get the station IPv4 address. Returns empty string while disconnected. */

@@ -504,7 +504,7 @@ static bool configure_diagnostics_screen(void)
 
     hint = create_label(
         diagnostics_screen,
-        "HTTP JSON  ·  PORT 8787  ·  Swipe right to return",
+        "TCP JSON  ·  PORT 8787  ·  Swipe right to return",
         MOB_COLOR_MUTED,
         LV_TEXT_ALIGN_LEFT
     );

@@ -35,7 +35,7 @@ typedef struct
     bool peer_configured;
     char peer_ip[PLAYBACK_BOARD_LINK_TCP_IPV4_MAX_LEN + 1U];
     uint32_t received_command_count;
-    uint32_t rejected_request_count;
+    uint32_t rejected_message_count;
     uint32_t sent_report_count;
     uint32_t failed_report_count;
 } playback_board_link_tcp_status_t;
@@ -57,6 +57,7 @@ typedef bool (*playback_board_link_tcp_snapshot_callback_t)(
 
 typedef struct
 {
+    const char *boot_id;
     playback_board_link_tcp_command_callback_t on_command;
     playback_board_link_tcp_status_callback_t on_status;
     playback_board_link_tcp_snapshot_callback_t get_snapshot;
@@ -69,30 +70,30 @@ typedef struct
 } playback_board_link_tcp_t;
 
 playback_board_link_tcp_result_t playback_board_link_tcp_init(
-    playback_board_link_tcp_t *http,
+    playback_board_link_tcp_t *tcp,
     const playback_board_link_tcp_config_t *config
 );
 
 playback_board_link_tcp_result_t playback_board_link_tcp_start(
-    playback_board_link_tcp_t *http
+    playback_board_link_tcp_t *tcp
 );
 
 playback_board_link_tcp_result_t playback_board_link_tcp_set_peer_ip(
-    playback_board_link_tcp_t *http,
+    playback_board_link_tcp_t *tcp,
     const char *peer_ip
 );
 
 playback_board_link_tcp_result_t playback_board_link_tcp_send_report(
-    playback_board_link_tcp_t *http,
+    playback_board_link_tcp_t *tcp,
     const playback_report_t *report
 );
 
 playback_board_link_tcp_result_t playback_board_link_tcp_get_status(
-    playback_board_link_tcp_t *http,
+    playback_board_link_tcp_t *tcp,
     playback_board_link_tcp_status_t *status
 );
 
-void playback_board_link_tcp_close(playback_board_link_tcp_t *http);
+void playback_board_link_tcp_close(playback_board_link_tcp_t *tcp);
 const char *playback_board_link_tcp_result_name(playback_board_link_tcp_result_t result);
 
 #ifdef __cplusplus
