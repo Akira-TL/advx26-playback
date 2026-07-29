@@ -16,7 +16,11 @@ extern "C"
 {
 #endif
 
-#define PLAYBACK_SCHEDULER_VIDEO_QUEUE_CAPACITY (3U)
+/* ~1.6s of video at 10fps; deep queue absorbs prefetch-window refill stalls. */
+#define PLAYBACK_SCHEDULER_VIDEO_QUEUE_CAPACITY (16U)
+
+/* 1 = drop audio entirely: wall-clock drives position, speaker never starts. */
+#define PLAYBACK_SCHEDULER_VIDEO_ONLY (1)
 
 typedef enum
 {

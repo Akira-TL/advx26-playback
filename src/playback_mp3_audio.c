@@ -12,6 +12,9 @@
 
 #include "tal_api.h"
 
+/* One ranged HTTP request per window instead of per MP3 frame (~418 bytes). */
+#define PLAYBACK_MP3_PREFETCH_WINDOW_BYTES (32U * 1024U)
+
 typedef struct
 {
     playback_audio_descriptor_t descriptor;
@@ -25,6 +28,10 @@ typedef struct
     HMP3Decoder decoder;
     uint8_t *compressed_frame;
     size_t compressed_capacity;
+    uint8_t *prefetch_window;
+    size_t prefetch_capacity;
+    uint64_t prefetch_offset;
+    size_t prefetch_length;
     int16_t *decoded_pcm;
     int16_t *pcm_ring;
     MUTEX_HANDLE pcm_mutex;
@@ -267,6 +274,10 @@ static void playback_mp3_release_state(playback_mp3_audio_state_t *state)
     {
         tal_psram_free(state->compressed_frame);
     }
+    if (state->prefetch_window != NULL)
+    {
+        tal_psram_free(state->prefetch_window);
+    }
     if (state->records != NULL)
     {
         tal_psram_free(state->records);
@@ -439,6 +450,67 @@ static playback_mp3_result_t playback_mp3_append_silence(
     return PLAYBACK_MP3_OK;
 }
 
+static playback_mp3_result_t playback_mp3_fetch_record_bytes(
+    playback_mp3_audio_state_t *state,
+    const playback_audio_index_record_t *record
+)
+{
+    playback_http_result_t http_result;
+    const uint64_t asset_length = state->descriptor.asset.byte_length;
+    uint64_t window_start;
+    uint64_t window_length;
+
+    if (state->prefetch_window == NULL)
+    {
+        http_result = playback_http_range_read_at(
+            &state->reader,
+            record->byte_offset,
+            record->byte_length,
+            state->compressed_frame,
+            state->compressed_capacity
+        );
+        return (http_result == PLAYBACK_HTTP_OK)
+            ? PLAYBACK_MP3_OK
+            : playback_mp3_http_result(http_result);
+    }
+
+    if ((record->byte_offset < state->prefetch_offset) ||
+        ((uint64_t)record->byte_offset + record->byte_length >
+         state->prefetch_offset + state->prefetch_length))
+    {
+        window_start = record->byte_offset;
+        window_length = asset_length - window_start;
+        if (window_length > state->prefetch_capacity)
+        {
+            window_length = state->prefetch_capacity;
+        }
+        if (window_length < record->byte_length)
+        {
+            return PLAYBACK_MP3_RESOURCE_MISMATCH;
+        }
+        http_result = playback_http_range_read_at(
+            &state->reader,
+            (uint32_t)window_start,
+            (uint32_t)window_length,
+            state->prefetch_window,
+            state->prefetch_capacity
+        );
+        if (http_result != PLAYBACK_HTTP_OK)
+        {
+            return playback_mp3_http_result(http_result);
+        }
+        state->prefetch_offset = window_start;
+        state->prefetch_length = (size_t)window_length;
+    }
+
+    memcpy(
+        state->compressed_frame,
+        state->prefetch_window + (record->byte_offset - state->prefetch_offset),
+        record->byte_length
+    );
+    return PLAYBACK_MP3_OK;
+}
+
 static playback_mp3_result_t playback_mp3_decode_current_record(
     playback_mp3_audio_state_t *state
 )
@@ -446,7 +518,6 @@ static playback_mp3_result_t playback_mp3_decode_current_record(
     const playback_audio_index_record_t *record = &state->records[state->next_record];
     const uint64_t record_start = record->pcm_sample_position;
     const uint64_t record_end = playback_mp3_record_end_frame(state, state->next_record);
-    playback_http_result_t http_result = PLAYBACK_HTTP_OK;
     playback_mp3_result_t append_result;
     MP3FrameInfo frame_info;
     unsigned char *cursor;
@@ -469,16 +540,11 @@ static playback_mp3_result_t playback_mp3_decode_current_record(
     }
     else
     {
-        http_result = playback_http_range_read_at(
-            &state->reader,
-            record->byte_offset,
-            record->byte_length,
-            state->compressed_frame,
-            state->compressed_capacity
-        );
-        if (http_result != PLAYBACK_HTTP_OK)
+        const playback_mp3_result_t fetch_result =
+            playback_mp3_fetch_record_bytes(state, record);
+        if (fetch_result != PLAYBACK_MP3_OK)
         {
-            return playback_mp3_http_result(http_result);
+            return fetch_result;
         }
     }
     if (playback_mp3_crc32(state->compressed_frame, record->byte_length) != record->crc32)
@@ -747,6 +813,12 @@ static playback_mp3_result_t playback_mp3_audio_prepare_source(
 
     if (!state->memory_source)
     {
+        /* Best effort: without the window we fall back to per-record reads. */
+        state->prefetch_window = tal_psram_malloc(PLAYBACK_MP3_PREFETCH_WINDOW_BYTES);
+        if (state->prefetch_window != NULL)
+        {
+            state->prefetch_capacity = PLAYBACK_MP3_PREFETCH_WINDOW_BYTES;
+        }
         http_result = playback_http_range_reader_init(
             &state->reader,
             &descriptor->asset,

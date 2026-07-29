@@ -7,11 +7,12 @@
 
 #include <string.h>
 
+#include "playback_http_download.h"
 #include "playback_http_range.h"
 #include "playback_media_package.h"
 #include "tal_api.h"
 
-#define PLAYBACK_ENGINE_WORKER_POLL_MS (50U)
+#define PLAYBACK_ENGINE_WORKER_POLL_MS (20U)
 #define PLAYBACK_ENGINE_WORKER_STACK_SIZE (12U * 1024U)
 #define PLAYBACK_ENGINE_INDEX_MAX_BYTES \
     (PLAYBACK_AUDIO_INDEX_HEADER_SIZE + \
@@ -42,6 +43,8 @@ typedef struct
     playback_engine_config_t config;
     playback_media_scheduler_t scheduler;
     bool scheduler_active;
+    /* Whole-file PSRAM staging for the video asset (memory-source demux). */
+    playback_http_download_file_t video_file;
     playback_snapshot_t snapshot;
     /* Worker-owned PSRAM scratch avoids multi-kilobyte command stack frames. */
     playback_snapshot_t scratch_snapshot;
@@ -358,6 +361,7 @@ static void playback_engine_publish_snapshot(
     }
 }
 
+#if !PLAYBACK_SCHEDULER_VIDEO_ONLY
 static playback_error_t playback_engine_http_error(playback_http_result_t result)
 {
     switch (result)
@@ -375,6 +379,7 @@ static playback_error_t playback_engine_http_error(playback_http_result_t result
             return PLAYBACK_ERROR_NETWORK_TIMEOUT;
     }
 }
+#endif /* !PLAYBACK_SCHEDULER_VIDEO_ONLY */
 
 static void playback_engine_set_error(
     playback_engine_state_t *state,
@@ -397,6 +402,7 @@ static void playback_engine_set_error(
     playback_engine_snapshot_store(state, snapshot);
 }
 
+#if !PLAYBACK_SCHEDULER_VIDEO_ONLY
 static playback_engine_result_t playback_engine_load_index(
     playback_engine_state_t *state,
     const playback_session_t *session,
@@ -490,6 +496,7 @@ static playback_engine_result_t playback_engine_load_index(
     *records_out = records;
     return PLAYBACK_ENGINE_OK;
 }
+#endif /* !PLAYBACK_SCHEDULER_VIDEO_ONLY */
 
 static bool playback_engine_session_matches(
     playback_engine_state_t *state,
@@ -567,7 +574,14 @@ static bool playback_engine_handle_load(
         playback_media_scheduler_close(&state->scheduler);
         state->scheduler_active = false;
     }
+    playback_http_download_release(&state->video_file);
 
+#if PLAYBACK_SCHEDULER_VIDEO_ONLY
+    /* Video-only: audio index is unused by the scheduler; skip its HTTP fetch. */
+    memset(&index, 0, sizeof(index));
+    (void)index_result;
+    (void)load_error;
+#else
     index_result = playback_engine_load_index(
         state,
         &command->payload.session,
@@ -585,19 +599,62 @@ static bool playback_engine_handle_load(
         );
         return true;
     }
+#endif
 
     tal_mutex_lock(state->snapshot_mutex);
     scheduler_config = state->config.scheduler;
     tal_mutex_unlock(state->snapshot_mutex);
+
+    if (scheduler_config.video_memory == NULL)
+    {
+        playback_http_download_result_t download_result;
+        SYS_TIME_T download_start = tal_system_get_millisecond();
+
+        download_result = playback_http_download_file(
+            package->session.video.asset.url,
+            scheduler_config.http.authorization,
+            package->session.video.asset.byte_length,
+            "VIDEO",
+            &state->video_file
+        );
+        if (download_result != PLAYBACK_HTTP_DOWNLOAD_OK)
+        {
+            if (records != NULL)
+            {
+                tal_psram_free(records);
+            }
+            playback_engine_set_error(
+                state,
+                (download_result == PLAYBACK_HTTP_DOWNLOAD_NO_MEMORY)
+                    ? PLAYBACK_ERROR_INTERNAL
+                    : PLAYBACK_ERROR_NETWORK_TIMEOUT,
+                download_result == PLAYBACK_HTTP_DOWNLOAD_NETWORK_ERROR,
+                playback_http_download_result_name(download_result)
+            );
+            return true;
+        }
+        PR_NOTICE(
+            "engine: video staged %u bytes in %u ms",
+            (unsigned int)state->video_file.length,
+            (unsigned int)(tal_system_get_millisecond() - download_start)
+        );
+        scheduler_config.video_memory = state->video_file.data;
+        scheduler_config.video_memory_length = state->video_file.length;
+    }
+
     scheduler_result = playback_media_scheduler_prepare(
         &state->scheduler,
         package,
         &index,
         &scheduler_config
     );
-    tal_psram_free(records);
+    if (records != NULL)
+    {
+        tal_psram_free(records);
+    }
     if (scheduler_result != PLAYBACK_SCHEDULER_OK)
     {
+        playback_http_download_release(&state->video_file);
         playback_engine_set_error(
             state,
             playback_media_scheduler_result_to_error(scheduler_result),
@@ -634,6 +691,7 @@ static bool playback_engine_handle_control(
             playback_media_scheduler_close(&state->scheduler);
             state->scheduler_active = false;
         }
+        playback_http_download_release(&state->video_file);
         playback_engine_snapshot_copy(state, snapshot);
         memset(&snapshot->session, 0, sizeof(snapshot->session));
         snapshot->has_session = false;
@@ -939,6 +997,7 @@ static void playback_engine_worker(void *argument)
                 playback_media_scheduler_close(&state->scheduler);
                 state->scheduler_active = false;
             }
+            playback_http_download_release(&state->video_file);
             tal_semaphore_post(state->worker_stopped);
             return;
         }

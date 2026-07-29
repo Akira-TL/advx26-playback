@@ -13,6 +13,8 @@
 #define PLAYBACK_MP4_FTYP_MAX_BYTES (256U)
 #define PLAYBACK_MP4_MAX_STSC_ENTRIES (PLAYBACK_MP4_MAX_SAMPLES)
 #define PLAYBACK_MP4_MAX_TIMESCALE (1000000U)
+/* One ranged HTTP request per window instead of per H264 sample. */
+#define PLAYBACK_MP4_PREFETCH_WINDOW_BYTES (128U * 1024U)
 
 #define MP4_FOURCC(a, b, c, d)                                                                                     \
     (((uint32_t)(uint8_t)(a) << 24U) | ((uint32_t)(uint8_t)(b) << 16U) | ((uint32_t)(uint8_t)(c) << 8U) |         \
@@ -137,6 +139,10 @@ typedef struct
     size_t parameter_sets_length;
     uint32_t mdat_payload_start;
     uint32_t mdat_end;
+    uint8_t *prefetch_window;
+    size_t prefetch_capacity;
+    uint64_t prefetch_offset;
+    size_t prefetch_length;
 } playback_mp4_state_t;
 
 typedef enum
@@ -1682,6 +1688,10 @@ static void playback_mp4_state_release(playback_mp4_state_t *state)
     {
         tal_free(state->sample_scratch);
     }
+    if (state->prefetch_window != NULL)
+    {
+        tal_psram_free(state->prefetch_window);
+    }
     if (state->samples != NULL)
     {
         tal_free(state->samples);
@@ -1753,6 +1763,13 @@ playback_mp4_result_t playback_mp4_demux_open(
         return PLAYBACK_MP4_NO_MEMORY;
     }
     state->sample_scratch_capacity = state->codec.max_sample_size;
+
+    /* Best-effort PSRAM prefetch window; direct per-sample reads when absent. */
+    state->prefetch_window = tal_psram_malloc(PLAYBACK_MP4_PREFETCH_WINDOW_BYTES);
+    if (state->prefetch_window != NULL)
+    {
+        state->prefetch_capacity = PLAYBACK_MP4_PREFETCH_WINDOW_BYTES;
+    }
     demux->state = state;
     return PLAYBACK_MP4_OK;
 }
@@ -1973,6 +1990,62 @@ static uint32_t playback_mp4_read_nal_length(const uint8_t *data, uint8_t length
     return value;
 }
 
+static playback_mp4_result_t playback_mp4_fetch_sample_bytes(
+    playback_mp4_state_t *state,
+    const playback_mp4_sample_t *sample
+)
+{
+    if (state->memory_source || (state->prefetch_window == NULL) ||
+        (sample->byte_length > state->prefetch_capacity))
+    {
+        return playback_mp4_read_at(
+            state,
+            sample->byte_offset,
+            sample->byte_length,
+            state->sample_scratch,
+            state->sample_scratch_capacity
+        );
+    }
+
+    if (((uint64_t)sample->byte_offset < state->prefetch_offset) ||
+        ((uint64_t)sample->byte_offset + sample->byte_length >
+         state->prefetch_offset + state->prefetch_length))
+    {
+        uint64_t window_start = sample->byte_offset;
+        uint64_t window_length = (uint64_t)state->mdat_end - window_start;
+        playback_mp4_result_t read_result;
+
+        if (window_length > state->prefetch_capacity)
+        {
+            window_length = state->prefetch_capacity;
+        }
+        if (window_length < sample->byte_length)
+        {
+            return PLAYBACK_MP4_CONTENT_INVALID;
+        }
+        read_result = playback_mp4_read_at(
+            state,
+            (uint32_t)window_start,
+            (uint32_t)window_length,
+            state->prefetch_window,
+            state->prefetch_capacity
+        );
+        if (read_result != PLAYBACK_MP4_OK)
+        {
+            return read_result;
+        }
+        state->prefetch_offset = window_start;
+        state->prefetch_length = (size_t)window_length;
+    }
+
+    memcpy(
+        state->sample_scratch,
+        state->prefetch_window + (sample->byte_offset - state->prefetch_offset),
+        sample->byte_length
+    );
+    return PLAYBACK_MP4_OK;
+}
+
 playback_mp4_result_t playback_mp4_demux_read_access_unit(
     playback_mp4_demux_t *demux,
     uint32_t sample_index,
@@ -2007,13 +2080,7 @@ playback_mp4_result_t playback_mp4_demux_read_access_unit(
         return PLAYBACK_MP4_CONTENT_INVALID;
     }
 
-    read_result = playback_mp4_read_at(
-        state,
-        sample->byte_offset,
-        sample->byte_length,
-        state->sample_scratch,
-        state->sample_scratch_capacity
-    );
+    read_result = playback_mp4_fetch_sample_bytes(state, sample);
     if (read_result != PLAYBACK_MP4_OK)
     {
         return read_result;

@@ -12,3 +12,4 @@ __pycache__/
 
 # Local demo credentials and endpoint
 include/demo_network_config.h
+.cache/

@@ -27,9 +27,11 @@ typedef struct
 /**
  * Download a complete HTTP resource into PSRAM using resumable 128 KiB segments.
  * expected_length must match the server's complete Content-Length.
+ * authorization: optional "Bearer <token>" header value (NULL/empty to skip).
  */
 playback_http_download_result_t playback_http_download_file(
     const char *url,
+    const char *authorization,
     uint32_t expected_length,
     const char *log_name,
     playback_http_download_file_t *file

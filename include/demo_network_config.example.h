@@ -12,5 +12,6 @@
 
 /* Keep the deployment token only in the ignored demo_network_config.h file. */
 #define DEMO_PLAYBACK_AUTHORIZATION "Bearer replace-playback-token"
+#define DEMO_TRIGGER_AUTHORIZATION  "Bearer replace-trigger-token"
 
 #endif /* DEMO_NETWORK_CONFIG_H */

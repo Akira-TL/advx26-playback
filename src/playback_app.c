@@ -9,7 +9,10 @@
 #include <string.h>
 
 #include "board_com_api.h"
+#include "demo_cloud.h"
+#include "demo_master_link.h"
 #include "demo_network_config.h"
+#include "demo_ui.h"
 #include "http_session.h"
 #include "lv_vendor.h"
 #include "lvgl.h"
@@ -103,6 +106,8 @@ static void playback_app_show_report(const playback_report_t *report)
     {
         return;
     }
+
+    demo_ui_notify_report(report);
 
     switch (report->kind)
     {
@@ -941,7 +946,20 @@ OPERATE_RET playback_app_start(void)
     mob_screen_neutralize_panel();
     mob_screen_update_network("", "");
 
-    result = playback_network_start();
+    {
+        tal_kv_cfg_t kv_cfg = {
+            .seed = "vmlkasdh93dlvlcy",
+            .key = "dflfuap134ddlduq",
+        };
+
+        result = tal_kv_init(&kv_cfg);
+        if (result != OPRT_OK)
+        {
+            PR_ERR("Playback KV initialization failed: %d", result);
+        }
+    }
+
+    result = playback_network_start_manual();
     if (result != OPRT_OK)
     {
         PR_ERR("Playback network initialization failed: %d", result);
@@ -991,7 +1009,7 @@ OPERATE_RET playback_app_start(void)
     memset(&engine_config, 0, sizeof(engine_config));
     strncpy(engine_config.boot_id, gatt_status.boot_id, sizeof(engine_config.boot_id) - 1U);
     engine_config.scheduler.http.timeout_ms = PLAYBACK_HTTP_DEFAULT_TIMEOUT_MS;
-    engine_config.scheduler.http.authorization = playback_app_authorization;
+    engine_config.scheduler.http.authorization = demo_cloud_playback_authorization();
     engine_config.scheduler.http.tls_no_verify = DEMO_HTTP_TLS_NO_VERIFY != 0;
     engine_config.scheduler.wired_speaker.volume =
         PLAYBACK_WIRED_SPEAKER_DEFAULT_VOLUME;
@@ -1083,6 +1101,11 @@ OPERATE_RET playback_app_start(void)
     playback_app_state.started = true;
     mob_screen_update_network(playback_network_get_local_ip(), "");
     mob_screen_show_state(PLAYBACK_STATE_IDLE, NULL);
+    demo_ui_start(&playback_app_state.engine);
+    if (demo_master_link_start(&playback_app_state.engine) != OPRT_OK)
+    {
+        PR_ERR("demo master link failed to start");
+    }
     PR_NOTICE(
         "Playback audio output: onboard wired speaker, mono, %u ms latency",
         PLAYBACK_WIRED_SPEAKER_DEFAULT_LATENCY_MS

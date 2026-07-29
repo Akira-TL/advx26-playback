@@ -34,6 +34,7 @@ static void playback_http_download_close_http(
 
 playback_http_download_result_t playback_http_download_file(
     const char *url,
+    const char *authorization,
     uint32_t expected_length,
     const char *log_name,
     playback_http_download_file_t *file
@@ -65,7 +66,8 @@ playback_http_download_result_t playback_http_download_file(
         http_session_t session = NULL;
         http_resp_t *response = NULL;
         http_req_t request;
-        http_custom_header_t request_headers[1U];
+        http_custom_header_t request_headers[2U];
+        uint8_t header_count = 0U;
         OPERATE_RET operation_result;
         const uint32_t remaining = expected_length - downloaded;
         const uint32_t segment_length =
@@ -93,12 +95,19 @@ playback_http_download_result_t playback_http_download_file(
         }
 
         memset(&request, 0, sizeof(request));
-        request_headers[0U].key = "Accept-Encoding";
-        request_headers[0U].value = "identity";
+        request_headers[header_count].key = "Accept-Encoding";
+        request_headers[header_count].value = "identity";
+        ++header_count;
+        if ((authorization != NULL) && (authorization[0] != '\0'))
+        {
+            request_headers[header_count].key = "Authorization";
+            request_headers[header_count].value = authorization;
+            ++header_count;
+        }
         request.type = HTTP_GET;
         request.version = HTTP_VER_1_1;
         request.custom_headers = request_headers;
-        request.custom_headers_count = 1U;
+        request.custom_headers_count = header_count;
         if (downloaded > 0U)
         {
             request.download_offset = downloaded;

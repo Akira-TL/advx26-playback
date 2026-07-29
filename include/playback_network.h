@@ -20,6 +20,12 @@ void playback_network_set_status_callback(
 /** Initialize the fixed runtime Wi-Fi connection used by media and Board Link TCP. */
 OPERATE_RET playback_network_start(void);
 
+/**
+ * Initialize timers, work queue, and Wi-Fi station mode without connecting.
+ * Used by the interactive demo where credentials come from the WiFi screen.
+ */
+OPERATE_RET playback_network_start_manual(void);
+
 /** Get the station IPv4 address. Returns empty string while disconnected. */
 const char *playback_network_get_local_ip(void);
 

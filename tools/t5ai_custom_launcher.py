@@ -151,6 +151,14 @@ def _install_project_hooks(
         build_dir.mkdir(parents=True, exist_ok=True)
         stamp.write_text(digest, encoding="utf-8")
 
+    def _quote(value: str) -> str:
+        # os.system on Windows goes through cmd.exe, which cannot parse
+        # POSIX '"'"' nesting; mimic the stock SDK's plain '{cmd}' wrapping
+        # with forward-slash paths instead of shlex.quote.
+        if os.name == "nt":
+            return value.replace("\\", "/")
+        return shlex.quote(value)
+
     def build(
         build_root: str,
         toolchain_folder_path: str,
@@ -162,28 +170,34 @@ def _install_project_hooks(
         build_root = build_root.replace("\\", "/")
         toolchain_folder_path = toolchain_folder_path.replace("\\", "/")
         command = (
-            f"export TUYA_TOOLCHAIN_PATH={shlex.quote(toolchain_folder_path)}; "
-            f"cd {shlex.quote(build_root)}; "
-            f"make {shlex.quote(target)} PROJECT=tuya_app "
-            f"PROJECT_DIR={shlex.quote(str(overlay_project))} "
-            f"APP_NAME={shlex.quote(app_name)} "
-            f"APP_VERSION={shlex.quote(app_ver)} -j"
+            f"export TUYA_TOOLCHAIN_PATH={_quote(toolchain_folder_path)}; "
+            f"cd {_quote(build_root)}; "
+            f"make {_quote(target)} PROJECT=tuya_app "
+            f"PROJECT_DIR={_quote(str(overlay_project))} "
+            f"APP_NAME={_quote(app_name)} "
+            f"APP_VERSION={_quote(app_ver)} -j"
         )
         if os.path.exists(bash_path):
-            command = f"{shlex.quote(bash_path)} -c {shlex.quote(command)}"
+            if os.name == "nt":
+                command = f"{bash_path} -c '{command}'"
+            else:
+                command = f"{shlex.quote(bash_path)} -c {shlex.quote(command)}"
         return module.do_subprocess(command) == 0
 
     def clean(build_root: str, toolchain_folder_path: str, bash_path: str) -> None:
         build_root = build_root.replace("\\", "/")
         toolchain_folder_path = toolchain_folder_path.replace("\\", "/")
         command = (
-            f"export TUYA_TOOLCHAIN_PATH={shlex.quote(toolchain_folder_path)}; "
-            f"cd {shlex.quote(build_root)}; "
+            f"export TUYA_TOOLCHAIN_PATH={_quote(toolchain_folder_path)}; "
+            f"cd {_quote(build_root)}; "
             f"make clean PROJECT=tuya_app "
-            f"PROJECT_DIR={shlex.quote(str(overlay_project))}"
+            f"PROJECT_DIR={_quote(str(overlay_project))}"
         )
         if os.path.exists(bash_path):
-            command = f"{shlex.quote(bash_path)} -c {shlex.quote(command)}"
+            if os.name == "nt":
+                command = f"{bash_path} -c '{command}'"
+            else:
+                command = f"{shlex.quote(bash_path)} -c {shlex.quote(command)}"
         module.do_subprocess(command)
 
     module.set_environment = set_environment

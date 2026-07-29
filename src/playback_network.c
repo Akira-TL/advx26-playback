@@ -64,6 +64,8 @@ static void playback_wifi_event_callback(WF_EVENT_E event, void *argument)
     {
         case WFE_CONNECTED:
             playback_wifi_connected = true;
+            /* Wi-Fi power save caps throughput at ~25KB/s; disable for streaming. */
+            (void)tal_wifi_lp_disable();
             if (playback_wifi_retry_timer != NULL)
             {
                 (void)tal_sw_timer_stop(playback_wifi_retry_timer);
@@ -203,6 +205,49 @@ OPERATE_RET playback_network_start(void)
         (int8_t *)DEMO_WIFI_SSID,
         (int8_t *)DEMO_WIFI_PASSWORD
     );
+#endif
+}
+
+OPERATE_RET playback_network_start_manual(void)
+{
+#if !defined(ENABLE_WIFI) || (ENABLE_WIFI != 1)
+    PR_ERR("Playback network requires ENABLE_WIFI=1");
+    return OPRT_NOT_SUPPORTED;
+#else
+    OPERATE_RET result;
+
+    result = tal_sw_timer_init();
+    if (result != OPRT_OK)
+    {
+        return result;
+    }
+    result = tal_workq_init();
+    if (result != OPRT_OK)
+    {
+        return result;
+    }
+
+#if defined(ENABLE_LIBLWIP) && (ENABLE_LIBLWIP == 1)
+    TUYA_LwIP_Init();
+#endif
+
+    result = tal_wifi_init(playback_wifi_event_callback);
+    if (result != OPRT_OK)
+    {
+        return result;
+    }
+    result = tal_wifi_set_work_mode(WWM_STATION);
+    if (result != OPRT_OK)
+    {
+        return result;
+    }
+
+    playback_wifi_connected = false;
+    playback_wifi_local_ip[0] = '\0';
+    playback_wifi_gateway[0] = '\0';
+    playback_wifi_publish_status();
+    PR_NOTICE("Playback Wi-Fi ready for interactive provisioning");
+    return OPRT_OK;
 #endif
 }
 

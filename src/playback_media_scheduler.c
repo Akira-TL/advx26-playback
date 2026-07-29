@@ -22,6 +22,14 @@
      PLAYBACK_WIRED_SPEAKER_WRITE_MS)
 #define PLAYBACK_SCHEDULER_ANNEX_B_OVERHEAD_BYTES (4U * PLAYBACK_MP4_MAX_NALS_PER_ACCESS_UNIT)
 #define PLAYBACK_SCHEDULER_PERF_LOG_INTERVAL_MS (1000U)
+/* Bound decode work per pump so presents keep running while the queue rebuilds. */
+#define PLAYBACK_SCHEDULER_VIDEO_FILL_MAX_PER_PUMP (2U)
+/* Extrapolate the audio clock while the audio worker is blocked on a refill. */
+#define PLAYBACK_SCHEDULER_POSITION_EXTRAPOLATE_MAX_MS (2000U)
+#define PLAYBACK_SCHEDULER_COMPLETION_CHECK_WINDOW_MS (2000U)
+/* Cap one clock step so a blocking window refill pauses playback instead of
+ * making every queued frame due at once (mass frame drop). */
+#define PLAYBACK_SCHEDULER_VIDEO_CLOCK_STEP_MAX_MS (120U)
 
 typedef struct
 {
@@ -84,6 +92,7 @@ typedef struct
     playback_intent_t intent;
     playback_error_t error;
     uint32_t position_ms;
+    uint64_t position_wall_ms;
     bool audio_output_enabled;
     playback_scheduler_perf_window_t perf;
 
@@ -627,7 +636,11 @@ static playback_media_scheduler_result_t playback_scheduler_decode_one(
             );
         }
         state->video_write = (uint8_t)((state->video_write + 1U) % PLAYBACK_SCHEDULER_VIDEO_QUEUE_CAPACITY);
+        /* Fill may run on the audio worker while presents pop on the engine
+         * thread; the count update is the SPSC hand-off point. */
+        tal_mutex_lock(state->status_mutex);
         state->video_count++;
+        tal_mutex_unlock(state->status_mutex);
         state->seeking = false;
     }
 
@@ -655,14 +668,18 @@ static playback_media_scheduler_result_t playback_scheduler_fill_video(
     playback_media_scheduler_state_t *state
 )
 {
+    uint8_t decoded = 0U;
+
     while ((state->video_count < PLAYBACK_SCHEDULER_VIDEO_QUEUE_CAPACITY) &&
-           !state->video_exhausted)
+           !state->video_exhausted &&
+           (decoded < PLAYBACK_SCHEDULER_VIDEO_FILL_MAX_PER_PUMP))
     {
         playback_media_scheduler_result_t result = playback_scheduler_decode_one(state);
         if (result != PLAYBACK_SCHEDULER_OK)
         {
             return result;
         }
+        decoded++;
     }
     return PLAYBACK_SCHEDULER_OK;
 }
@@ -703,7 +720,9 @@ static playback_media_scheduler_result_t playback_scheduler_present_due(
     while (due > 1U)
     {
         state->video_read = (uint8_t)((state->video_read + 1U) % PLAYBACK_SCHEDULER_VIDEO_QUEUE_CAPACITY);
+        tal_mutex_lock(state->status_mutex);
         state->video_count--;
+        tal_mutex_unlock(state->status_mutex);
         state->dropped_video_frames++;
         due--;
     }
@@ -725,7 +744,9 @@ static playback_media_scheduler_result_t playback_scheduler_present_due(
             );
         }
         state->video_read = (uint8_t)((state->video_read + 1U) % PLAYBACK_SCHEDULER_VIDEO_QUEUE_CAPACITY);
+        tal_mutex_lock(state->status_mutex);
         state->video_count--;
+        tal_mutex_unlock(state->status_mutex);
     }
 
     return PLAYBACK_SCHEDULER_OK;
@@ -863,6 +884,11 @@ playback_media_scheduler_result_t playback_media_scheduler_prepare(
         return PLAYBACK_SCHEDULER_NO_MEMORY;
     }
 
+#if PLAYBACK_SCHEDULER_VIDEO_ONLY
+    /* Video-only: skip the MP3 prepare (audio index + metadata HTTP probes). */
+    (void)audio_index;
+    (void)mp3_result;
+#else
     if (state->config.audio_memory != NULL)
     {
         mp3_result = playback_mp3_audio_prepare_memory(
@@ -890,6 +916,7 @@ playback_media_scheduler_result_t playback_media_scheduler_prepare(
         return PLAYBACK_SCHEDULER_AUDIO_FAILED;
     }
     (void)playback_mp3_audio_pause(&state->audio, PLAYBACK_MP3_PAUSE_OUTPUT);
+#endif
 
     if (state->config.video_memory != NULL)
     {
@@ -1030,7 +1057,8 @@ playback_media_scheduler_result_t playback_media_scheduler_prepare(
     {
         THREAD_CFG_T audio_thread_config;
         memset(&audio_thread_config, 0, sizeof(audio_thread_config));
-        audio_thread_config.stackDepth = (8U * 1024U);
+        /* Worker now runs HTTP fetch + H264 decode in video-only mode. */
+        audio_thread_config.stackDepth = (16U * 1024U);
         audio_thread_config.priority = THREAD_PRIO_1;
         audio_thread_config.thrdname = "playback_audio";
         audio_thread_config.psram_mode = 1U;
@@ -1181,6 +1209,7 @@ playback_media_scheduler_result_t playback_media_scheduler_seek(
             PLAYBACK_ERROR_INTERNAL
         );
     }
+#if !PLAYBACK_SCHEDULER_VIDEO_ONLY
     mp3_result = playback_mp3_audio_seek(&state->audio, target_pcm_frame);
     if (mp3_result != PLAYBACK_MP3_OK)
     {
@@ -1191,6 +1220,9 @@ playback_media_scheduler_result_t playback_media_scheduler_seek(
             playback_mp3_result_to_error(mp3_result)
         );
     }
+#else
+    (void)mp3_result;
+#endif
 
     mp4_result = playback_mp4_demux_find_sync_at_or_before(&state->demux, position_ms, &sync_sample);
     if (mp4_result != PLAYBACK_MP4_OK)
@@ -1224,6 +1256,7 @@ playback_media_scheduler_result_t playback_media_scheduler_seek(
 
     tal_mutex_lock(state->status_mutex);
     state->position_ms = position_ms;
+    state->position_wall_ms = 0ULL;
     state->state = (state->intent == PLAYBACK_INTENT_PLAYING)
                        ? PLAYBACK_STATE_BUFFERING
                        : PLAYBACK_STATE_PAUSED;
@@ -1292,6 +1325,27 @@ static void playback_scheduler_audio_pump_locked(playback_media_scheduler_state_
         return;
     }
 
+#if PLAYBACK_SCHEDULER_VIDEO_ONLY
+    /* Video-only: this worker becomes the video prefetch+decode thread so the
+     * engine-thread pump (clock + present) never blocks on HTTP. */
+    (void)intent;
+    (void)audio_status;
+    (void)speaker_status;
+    (void)mp3_result;
+    (void)speaker_result;
+    (void)audio_submitted_complete;
+    (void)audio_audible_complete;
+    (void)pump_started_ms;
+    (void)phase_started_ms;
+    (void)mp3_fill_ms;
+    (void)speaker_ms;
+    (void)speaker_write_count;
+    (void)speaker_write_max_ms;
+    (void)position_ms;
+    (void)playback_scheduler_fill_video(state);
+    return;
+#endif
+
     /* -- MP3 fill -------------------------------------------------------- */
     if (playback_mp3_audio_get_status(&state->audio, &audio_status) != PLAYBACK_MP3_OK)
     {
@@ -1336,6 +1390,7 @@ static void playback_scheduler_audio_pump_locked(playback_media_scheduler_state_
     }
     tal_mutex_lock(state->status_mutex);
     state->position_ms = position_ms;
+    state->position_wall_ms = tal_system_get_millisecond();
     tal_mutex_unlock(state->status_mutex);
 
     /* -- Pause ---------------------------------------------------------- */
@@ -1567,24 +1622,77 @@ playback_media_scheduler_result_t playback_media_scheduler_pump(
         return PLAYBACK_SCHEDULER_ERROR_STATE;
     }
 
+#if PLAYBACK_SCHEDULER_VIDEO_ONLY
+    if (current_state == PLAYBACK_STATE_COMPLETED)
+    {
+        return PLAYBACK_SCHEDULER_OK;
+    }
+    if (intent == PLAYBACK_INTENT_PAUSED)
+    {
+        tal_mutex_lock(state->status_mutex);
+        state->position_wall_ms = 0ULL;
+        tal_mutex_unlock(state->status_mutex);
+        playback_scheduler_set_runtime(state, PLAYBACK_STATE_PAUSED, PLAYBACK_ERROR_NONE);
+        return PLAYBACK_SCHEDULER_OK;
+    }
+
+    /* -- Video-master clock: freeze while the queue is empty ------------- */
+    tal_mutex_lock(state->status_mutex);
+    if ((state->video_count == 0U) && !state->video_exhausted)
+    {
+        state->position_wall_ms = 0ULL;
+        position_ms = state->position_ms;
+        tal_mutex_unlock(state->status_mutex);
+        playback_scheduler_set_runtime(state, PLAYBACK_STATE_BUFFERING, PLAYBACK_ERROR_NONE);
+    }
+    else
+    {
+        uint64_t now_ms = tal_system_get_millisecond();
+        if (state->position_wall_ms != 0ULL)
+        {
+            uint64_t elapsed_ms = (now_ms > state->position_wall_ms)
+                                      ? (now_ms - state->position_wall_ms)
+                                      : 0ULL;
+            uint64_t next_ms;
+            if (elapsed_ms > PLAYBACK_SCHEDULER_VIDEO_CLOCK_STEP_MAX_MS)
+            {
+                elapsed_ms = PLAYBACK_SCHEDULER_VIDEO_CLOCK_STEP_MAX_MS;
+            }
+            next_ms = (uint64_t)state->position_ms + elapsed_ms;
+            if (next_ms > state->package.session.duration_ms)
+            {
+                next_ms = state->package.session.duration_ms;
+            }
+            state->position_ms = (uint32_t)next_ms;
+        }
+        state->position_wall_ms = now_ms;
+        position_ms = state->position_ms;
+        tal_mutex_unlock(state->status_mutex);
+        playback_scheduler_set_runtime(state, PLAYBACK_STATE_PLAYING, PLAYBACK_ERROR_NONE);
+    }
+#else
     if (intent == PLAYBACK_INTENT_PAUSED)
     {
         return PLAYBACK_SCHEDULER_OK;
     }
 
-    /* -- Video decode --------------------------------------------------- */
-    phase_started_ms = tal_system_get_millisecond();
-    result = playback_scheduler_fill_video(state);
-    video_fill_ms = playback_scheduler_elapsed_ms(phase_started_ms);
-    if (result != PLAYBACK_SCHEDULER_OK)
-    {
-        return result;
-    }
-
-    /* -- Present -------------------------------------------------------- */
+    /* -- Present first so a slow network fill cannot starve the display -- */
     tal_mutex_lock(state->status_mutex);
     position_ms = state->position_ms;
+    if ((current_state == PLAYBACK_STATE_PLAYING) && (state->position_wall_ms != 0ULL))
+    {
+        uint64_t now_ms = tal_system_get_millisecond();
+        uint64_t elapsed_ms = (now_ms > state->position_wall_ms)
+                                  ? (now_ms - state->position_wall_ms)
+                                  : 0ULL;
+        if (elapsed_ms > PLAYBACK_SCHEDULER_POSITION_EXTRAPOLATE_MAX_MS)
+        {
+            elapsed_ms = PLAYBACK_SCHEDULER_POSITION_EXTRAPOLATE_MAX_MS;
+        }
+        position_ms += (uint32_t)elapsed_ms;
+    }
     tal_mutex_unlock(state->status_mutex);
+#endif
     phase_started_ms = tal_system_get_millisecond();
     result = playback_scheduler_present_due(state, position_ms);
     present_ms = playback_scheduler_elapsed_ms(phase_started_ms);
@@ -1593,12 +1701,33 @@ playback_media_scheduler_result_t playback_media_scheduler_pump(
         return result;
     }
 
-    /* -- Completion: audio done, drain remaining video ------------------ */
+    /* -- Video decode --------------------------------------------------- */
+#if PLAYBACK_SCHEDULER_VIDEO_ONLY
+    /* The audio worker thread owns fill (HTTP + decode); nothing to do here. */
+#else
+    phase_started_ms = tal_system_get_millisecond();
+    result = playback_scheduler_fill_video(state);
+    video_fill_ms = playback_scheduler_elapsed_ms(phase_started_ms);
+    if (result != PLAYBACK_SCHEDULER_OK)
     {
+        return result;
+    }
+#endif
+
+    /* -- Completion: audio done, drain remaining video ------------------ */
+    if (state->video_exhausted ||
+        ((uint64_t)position_ms + PLAYBACK_SCHEDULER_COMPLETION_CHECK_WINDOW_MS >=
+         state->package.session.duration_ms))
+    {
+        bool audio_audible_complete;
+
+#if PLAYBACK_SCHEDULER_VIDEO_ONLY
+        audio_audible_complete =
+            ((uint64_t)position_ms >= state->package.session.duration_ms);
+#else
         playback_mp3_status_t audio_status;
         playback_wired_speaker_status_t speaker_status;
         bool audio_submitted_complete;
-        bool audio_audible_complete;
 
         tal_mutex_lock(state->audio_mutex);
         if ((playback_mp3_audio_get_status(&state->audio, &audio_status) != PLAYBACK_MP3_OK) ||
@@ -1620,6 +1749,7 @@ playback_media_scheduler_result_t playback_media_scheduler_pump(
         audio_audible_complete = audio_submitted_complete &&
                                  (speaker_status.audible_pcm_frames >=
                                   audio_status.expected_pcm_frames);
+#endif
         if (audio_audible_complete)
         {
             phase_started_ms = tal_system_get_millisecond();
@@ -1701,6 +1831,10 @@ playback_media_scheduler_result_t playback_media_scheduler_get_snapshot(
                    ? PLAYBACK_SCHEDULER_INVALID_ARGUMENT
                    : PLAYBACK_SCHEDULER_NOT_PREPARED;
     }
+#if PLAYBACK_SCHEDULER_VIDEO_ONLY
+    memset(&audio_status, 0, sizeof(audio_status));
+    memset(&speaker_status, 0, sizeof(speaker_status));
+#else
     tal_mutex_lock(state->audio_mutex);
     if (playback_mp3_audio_get_status(&state->audio, &audio_status) != PLAYBACK_MP3_OK)
     {
@@ -1714,6 +1848,7 @@ playback_media_scheduler_result_t playback_media_scheduler_get_snapshot(
         return PLAYBACK_SCHEDULER_SPEAKER_FAILED;
     }
     tal_mutex_unlock(state->audio_mutex);
+#endif
 
     memset(snapshot, 0, sizeof(*snapshot));
     tal_mutex_lock(state->status_mutex);
@@ -1721,10 +1856,14 @@ playback_media_scheduler_result_t playback_media_scheduler_get_snapshot(
     snapshot->state = state->state;
     snapshot->intent = state->intent;
     snapshot->error = state->error;
+#if PLAYBACK_SCHEDULER_VIDEO_ONLY
+    snapshot->position_ms = state->position_ms;
+#else
     snapshot->position_ms = playback_scheduler_frames_to_ms(
         speaker_status.audible_pcm_frames,
         audio_status.sample_rate
     );
+#endif
     if (snapshot->position_ms > state->package.session.duration_ms)
     {
         snapshot->position_ms = state->package.session.duration_ms;

@@ -52,6 +52,7 @@ static playback_av_test_result_t playback_av_test_load_index(
 
     download_result = playback_http_download_file(
         session->audio.index_asset.url,
+        NULL,
         byte_length,
         "INDEX",
         &payload
@@ -169,6 +170,7 @@ playback_av_test_result_t playback_av_test_run(
 
     download_result = playback_http_download_file(
         session->audio.asset.url,
+        NULL,
         session->audio.asset.byte_length,
         "AUDIO",
         &audio_file
@@ -187,6 +189,7 @@ playback_av_test_result_t playback_av_test_run(
 
     download_result = playback_http_download_file(
         session->video.asset.url,
+        NULL,
         session->video.asset.byte_length,
         "VIDEO",
         &video_file
